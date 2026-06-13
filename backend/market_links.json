@@ -1,0 +1,32 @@
+[
+  {
+    "id": "world-cup-winner",
+    "title": "World Cup Winner",
+    "markets": [
+      {
+        "id": "spain-world-cup-winner",
+        "title": "Spain",
+        "outcomes": [
+          {
+            "id": "spain-yes",
+            "title": "Spain wins",
+            "sources": [
+              {
+                "platform": "polymarket",
+                "eventSlug": "world-cup-winner",
+                "marketId": "558934",
+                "outcome": "yes"
+              },
+              {
+                "platform": "predictfun",
+                "marketId": "1518",
+                "outcome": "yes",
+                "tokenId": "89062960556466101171886316219016506901091710185836291909953678481100681595696"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

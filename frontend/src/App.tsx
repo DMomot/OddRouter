@@ -1,14 +1,48 @@
 import { useEffect, useRef, useState } from 'react'
 import { DynamicWidget } from '@dynamic-labs/sdk-react-core'
-import { Polymarket, type Event, type Market } from 'polymarket-data'
-import eventIds from './eventIds.json'
+import eventSlugs from './eventIds.json'
 import './App.css'
 
-const polymarket = new Polymarket()
+const apiBaseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
+
+type SourcePlatform = 'polymarket' | 'predictfun'
+type OrderBookPlatform = SourcePlatform | 'combined'
+
+type MarketSource = {
+  platform: SourcePlatform
+  outcome?: OutcomeSide
+  marketId?: string
+  tokenId?: string
+  yesTokenId?: string
+  noTokenId?: string
+}
+
+type Market = {
+  id: string
+  title: string
+  question: string
+  image: string
+  yesPrice: string
+  noPrice: string
+  yesTokenId: string
+  noTokenId: string
+  volume?: number | string | null
+  sources?: MarketSource[]
+}
+
+type Event = {
+  id: string
+  slug?: string | null
+  title?: string | null
+  image?: string | null
+  volume?: number | string | null
+  markets?: Market[] | null
+}
 
 type Order = {
   price: string
   size: string
+  platform?: OrderBookPlatform
 }
 
 type OrderBook = {
@@ -16,21 +50,22 @@ type OrderBook = {
   bids: Order[]
 }
 
+type Quote = {
+  spent: number
+  unspent: number
+  shares: number
+  avgPrice: number
+  payoutIfWin: number
+  profitIfWin: number
+  filled: boolean
+  levels: Array<{
+    platform: SourcePlatform
+    cost: number
+  }>
+}
+
 type OutcomeSide = 'yes' | 'no'
-
-function parseJsonList(value?: string | null) {
-  if (!value) return []
-
-  try {
-    return JSON.parse(value) as string[]
-  } catch {
-    return []
-  }
-}
-
-function asText(value: unknown) {
-  return typeof value === 'string' ? value : ''
-}
+const orderBookPlatforms: OrderBookPlatform[] = ['combined', 'predictfun', 'polymarket']
 
 function formatPercent(value?: string) {
   const price = Number(value ?? 0)
@@ -61,8 +96,79 @@ function formatTotal(order: Order) {
   })}`
 }
 
+function formatUsd(value?: number) {
+  return `$${Number(value ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+}
+
+function formatAmountInput(value: string) {
+  if (!value) return ''
+
+  const [integer, decimal] = value.split('.')
+  const formattedInteger = Number(integer || 0).toLocaleString()
+
+  return decimal === undefined ? formattedInteger : `${formattedInteger}.${decimal}`
+}
+
+function parseAmountInput(value: string) {
+  const normalized = value.replace(/,/g, '').replace(/[^\d.]/g, '')
+  const [integer, ...decimalParts] = normalized.split('.')
+  const decimal = decimalParts.join('')
+
+  return decimalParts.length > 0 ? `${integer}.${decimal}` : integer
+}
+
+function getQuoteRoutes(quote: Quote) {
+  const costByPlatform = new Map<SourcePlatform, number>()
+
+  quote.levels.forEach((level) => {
+    costByPlatform.set(level.platform, (costByPlatform.get(level.platform) ?? 0) + level.cost)
+  })
+
+  const totalCost = [...costByPlatform.values()].reduce((total, cost) => total + cost, 0)
+
+  return [...costByPlatform.entries()]
+    .map(([platform, cost]) => ({
+      platform,
+      cost,
+      percent: totalCost ? (cost / totalCost) * 100 : 0,
+    }))
+    .sort((first, second) => second.cost - first.cost)
+}
+
+function routeColor(platform: SourcePlatform) {
+  return platform === 'polymarket' ? '#86efac' : '#60a5fa'
+}
+
+function routeChart(routes: ReturnType<typeof getQuoteRoutes>) {
+  if (routes.length === 0) return '#263244'
+
+  let cursor = 0
+  const stops = routes.map((route) => {
+    const start = cursor
+    cursor += route.percent
+    return `${routeColor(route.platform)} ${start}% ${cursor}%`
+  })
+
+  return `conic-gradient(${stops.join(', ')})`
+}
+
+function platformLabel(platform: OrderBookPlatform) {
+  if (platform === 'polymarket') return 'Polymarket'
+  if (platform === 'predictfun') return 'PredictFun'
+
+  return 'Combined'
+}
+
 function getEventSlugFromPath() {
   return window.location.pathname.replace(/^\/+/, '')
+}
+
+async function fetchApi<T>(path: string): Promise<T> {
+  const response = await fetch(`${apiBaseUrl}${path}`)
+
+  if (!response.ok) throw new Error(await response.text())
+
+  return response.json() as Promise<T>
 }
 
 function App() {
@@ -73,15 +179,20 @@ function App() {
   const [selectedMarketId, setSelectedMarketId] = useState('')
   const [expandedMarketId, setExpandedMarketId] = useState('')
   const [selectedOutcome, setSelectedOutcome] = useState<OutcomeSide>('yes')
+  const [selectedOrderBookPlatform, setSelectedOrderBookPlatform] = useState<OrderBookPlatform>('combined')
   const [orderBook, setOrderBook] = useState<OrderBook | null>(null)
   const [orderBookLoading, setOrderBookLoading] = useState(false)
+  const [amount, setAmount] = useState('')
+  const [quote, setQuote] = useState<Quote | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
   useEffect(() => {
     async function loadEvents() {
       try {
-        const loadedEvents = await Promise.all(eventIds.map((eventId) => polymarket.gamma.events.getEventById(eventId)))
+        const loadedEvents = await Promise.all(
+          eventSlugs.map((eventSlug) => fetchApi<Event>(`/api/merged-events/${eventSlug}`)),
+        )
         const eventSlug = getEventSlugFromPath()
         const eventFromUrl = loadedEvents.find((event) => event.slug === eventSlug)
 
@@ -112,6 +223,7 @@ function App() {
       setSelectedMarketId(eventFromUrl ? ((eventFromUrl.markets as Market[] | undefined)?.[0]?.id ?? '') : '')
       setExpandedMarketId('')
       setSelectedOutcome('yes')
+      setSelectedOrderBookPlatform('combined')
     }
 
     window.addEventListener('popstate', syncEventFromUrl)
@@ -122,23 +234,65 @@ function App() {
     { length: Math.max(0, 9 - events.length) },
     (_, index) => index + 1,
   )
-  const selectedMarkets = ([...(selectedEvent?.markets ?? [])] as Market[]).sort((a, b) => {
-    const aYes = Number(parseJsonList(asText(a.outcomePrices))[0] ?? 0)
-    const bYes = Number(parseJsonList(asText(b.outcomePrices))[0] ?? 0)
-    return bYes - aYes
-  })
+  const selectedMarkets = [...(selectedEvent?.markets ?? [])] as Market[]
   const selectedMarket = selectedMarkets.find((market) => market.id === selectedMarketId) ?? selectedMarkets[0]
   const expandedMarket = selectedMarkets.find((market) => market.id === expandedMarketId)
-  const selectedPrices = parseJsonList(asText(selectedMarket?.outcomePrices))
-  const asks = [...(orderBook?.asks ?? [])].sort((a, b) => Number(b.price) - Number(a.price))
-  const bids = [...(orderBook?.bids ?? [])].sort((a, b) => Number(b.price) - Number(a.price))
+  const asks = orderBook?.asks ?? []
+  const bids = orderBook?.bids ?? []
+
+  async function fetchOrderBook(platform: SourcePlatform, market: Market) {
+    if (platform === 'polymarket') {
+      const tokenId = selectedOutcome === 'yes' ? market.yesTokenId : market.noTokenId
+      if (!tokenId) return null
+
+      const book = await fetchApi<OrderBook>(`/api/orderbook/${tokenId}?platform=polymarket`)
+      return {
+        asks: book.asks.map((order) => ({ ...order, platform })),
+        bids: book.bids.map((order) => ({ ...order, platform })),
+      }
+    }
+
+    const predictSource = market.sources?.find((source) => source.platform === 'predictfun')
+    if (!predictSource?.marketId) return null
+
+    const book = await fetchApi<OrderBook>(
+      `/api/orderbook/${predictSource.marketId}?platform=predictfun&outcome=${selectedOutcome}`,
+    )
+    return {
+      asks: book.asks.map((order) => ({ ...order, platform })),
+      bids: book.bids.map((order) => ({ ...order, platform })),
+    }
+  }
+
+  function mergeOrders(orders: Order[]) {
+    const step = 0.001
+    const liquidityByPrice = new Map<string, number>()
+
+    orders.forEach((order) => {
+      const price = Math.round(Number(order.price) / step) * step
+      const priceKey = price.toFixed(3)
+      const size = Number(order.size)
+
+      if (!size) return
+
+      liquidityByPrice.set(priceKey, (liquidityByPrice.get(priceKey) ?? 0) + size)
+    })
+
+    return [...liquidityByPrice.entries()]
+      .map(([price, size]) => ({ price: String(Number(price)), size: String(size), platform: 'combined' as const }))
+      .sort((a, b) => Number(b.price) - Number(a.price))
+  }
+
+  function mergeOrderBooks(books: OrderBook[]) {
+    return {
+      asks: mergeOrders(books.flatMap((book) => book.asks)),
+      bids: mergeOrders(books.flatMap((book) => book.bids)),
+    }
+  }
 
   useEffect(() => {
     async function loadOrderBook() {
-      const tokenIds = parseJsonList(asText(expandedMarket?.clobTokenIds))
-      const tokenId = selectedOutcome === 'yes' ? tokenIds[0] : tokenIds[1]
-
-      if (!tokenId) {
+      if (!expandedMarket) {
         setOrderBook(null)
         return
       }
@@ -146,8 +300,16 @@ function App() {
       setOrderBookLoading(true)
 
       try {
-        const response = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`)
-        setOrderBook(await response.json() as OrderBook)
+        if (selectedOrderBookPlatform === 'combined') {
+          const books = await Promise.all([
+            fetchOrderBook('polymarket', expandedMarket),
+            fetchOrderBook('predictfun', expandedMarket),
+          ])
+          setOrderBook(mergeOrderBooks(books.filter(Boolean) as OrderBook[]))
+          return
+        }
+
+        setOrderBook(await fetchOrderBook(selectedOrderBookPlatform, expandedMarket))
       } catch {
         setOrderBook(null)
       } finally {
@@ -156,7 +318,7 @@ function App() {
     }
 
     loadOrderBook()
-  }, [expandedMarket?.clobTokenIds, selectedOutcome])
+  }, [expandedMarket, selectedOutcome, selectedOrderBookPlatform])
 
   useEffect(() => {
     if (!orderBook || orderBookLoading) return
@@ -170,6 +332,39 @@ function App() {
       table.scrollTop = spread.offsetTop - table.offsetTop - table.clientHeight / 2
     })
   }, [orderBook, orderBookLoading, selectedMarketId])
+
+  useEffect(() => {
+    async function loadQuote() {
+      const value = Number(amount)
+      const eventId = selectedEvent?.slug ?? ''
+
+      if (!eventId || !selectedMarket?.id || value <= 0) {
+        setQuote(null)
+        return
+      }
+
+      const params = new URLSearchParams({
+        event_id: eventId,
+        market_id: selectedMarket.id,
+        outcome: selectedOutcome,
+        amount: String(value),
+        platform: selectedOrderBookPlatform,
+      })
+
+      try {
+        const nextQuote = await fetchApi<Quote>(`/api/combined-orderbook/quote?${params.toString()}`)
+        setQuote(nextQuote.levels.length ? nextQuote : null)
+      } catch {
+        setQuote(null)
+      }
+    }
+
+    loadQuote()
+  }, [amount, selectedEvent?.slug, selectedMarket?.id, selectedOutcome, selectedOrderBookPlatform])
+
+  function addAmount(value: number) {
+    setAmount(String(Number(amount || 0) + value))
+  }
 
   return (
     <main className="app">
@@ -204,13 +399,12 @@ function App() {
           <section className="detail-view">
             <div className="markets-panel">
               <div className="detail-head">
-                <img src={selectedEvent.image ?? selectedEvent.icon ?? ''} alt="" />
+                <img src={selectedEvent.image ?? ''} alt="" />
                 <h2>{selectedEvent.title?.trim()}</h2>
               </div>
 
               <div className="detail-list">
                 {selectedMarkets.map((market) => {
-                  const prices = parseJsonList(asText(market.outcomePrices))
                   const isSelected = market.id === selectedMarket.id
                   const isExpanded = market.id === expandedMarketId
 
@@ -222,14 +416,15 @@ function App() {
                           setSelectedMarketId(market.id)
                           setExpandedMarketId(isExpanded ? '' : market.id)
                           setSelectedOutcome('yes')
+                          setSelectedOrderBookPlatform('combined')
                         }}
                       >
-                        <img src={market.image ?? market.icon ?? selectedEvent.image ?? ''} alt="" />
+                        <img src={market.image || selectedEvent.image || ''} alt="" />
                         <div className="detail-title">
-                          <strong>{market.groupItemTitle ?? market.question}</strong>
-                          <span>{formatVolume(market.volumeNum ?? market.volume)}</span>
+                          <strong>{market.title}</strong>
+                          <span>{formatVolume(market.volume)}</span>
                         </div>
-                        <strong className="detail-price">{formatPercent(prices[0])}</strong>
+                        <strong className="detail-price">{formatPercent(market.yesPrice)}</strong>
                         <span className="detail-change">▲ 1%</span>
                         <button
                           className={isExpanded && selectedOutcome === 'yes' ? 'detail-buy yes active' : 'detail-buy yes'}
@@ -239,9 +434,10 @@ function App() {
                             setSelectedMarketId(market.id)
                             setExpandedMarketId(market.id)
                             setSelectedOutcome('yes')
+                            setSelectedOrderBookPlatform('combined')
                           }}
                         >
-                          Buy Yes {formatCents(prices[0])}
+                          Buy Yes {formatCents(market.yesPrice)}
                         </button>
                         <button
                           className={isExpanded && selectedOutcome === 'no' ? 'detail-buy no active' : 'detail-buy no'}
@@ -251,21 +447,33 @@ function App() {
                             setSelectedMarketId(market.id)
                             setExpandedMarketId(market.id)
                             setSelectedOutcome('no')
+                            setSelectedOrderBookPlatform('combined')
                           }}
                         >
-                          Buy No {formatCents(prices[1])}
+                          Buy No {formatCents(market.noPrice)}
                         </button>
                       </div>
 
                       {isExpanded && (
                         <div className="orderbook">
                           <div className="orderbook-tabs">
-                            <strong>Order Book</strong>
+                            <div className="orderbook-platforms">
+                              {orderBookPlatforms.map((platform) => (
+                                <button
+                                  className={selectedOrderBookPlatform === platform ? 'active' : ''}
+                                  key={platform}
+                                  type="button"
+                                  onClick={() => setSelectedOrderBookPlatform(platform)}
+                                >
+                                  {platformLabel(platform)}
+                                </button>
+                              ))}
+                            </div>
                           </div>
 
                           <div className="orderbook-table" ref={orderBookTableRef}>
                             <div className="orderbook-header">
-                              <span>Trade {selectedOutcome === 'yes' ? 'Yes' : 'No'}</span>
+                              <span></span>
                               <span>Price</span>
                               <span>Shares</span>
                               <span>Total</span>
@@ -273,12 +481,16 @@ function App() {
 
                             {orderBookLoading && <p className="orderbook-state">Loading order book...</p>}
 
-                            {!orderBookLoading && (
+                            {!orderBookLoading && asks.length === 0 && bids.length === 0 && (
+                              <p className="orderbook-state">No liquidity</p>
+                            )}
+
+                            {!orderBookLoading && (asks.length > 0 || bids.length > 0) && (
                               <>
                                 <div className="orderbook-side asks">
                                   <span className="side-label">Asks</span>
                                   {asks.map((order) => (
-                                    <div className="order-row" key={`ask-${order.price}-${order.size}`}>
+                                    <div className="order-row" key={`ask-${order.platform}-${order.price}-${order.size}`}>
                                       <span></span>
                                       <strong>{formatCents(order.price)}</strong>
                                       <span>{formatShares(order.size)}</span>
@@ -288,14 +500,14 @@ function App() {
                                 </div>
 
                                 <div className="spread-row" ref={spreadRowRef}>
-                                  <span>Last: {formatCents(selectedOutcome === 'yes' ? prices[0] : prices[1])}</span>
+                                  <span>Last: {formatCents(selectedOutcome === 'yes' ? market.yesPrice : market.noPrice)}</span>
                                   <span>Spread: 0.1c</span>
                                 </div>
 
                                 <div className="orderbook-side bids">
                                   <span className="side-label">Bids</span>
                                   {bids.map((order) => (
-                                    <div className="order-row" key={`bid-${order.price}-${order.size}`}>
+                                    <div className="order-row" key={`bid-${order.platform}-${order.price}-${order.size}`}>
                                       <span></span>
                                       <strong>{formatCents(order.price)}</strong>
                                       <span>{formatShares(order.size)}</span>
@@ -315,17 +527,11 @@ function App() {
             </div>
             <aside className="bet-card">
               <div className="bet-head">
-                <img src={selectedMarket.image ?? selectedMarket.icon ?? selectedEvent.image ?? ''} alt="" />
+                <img src={selectedMarket.image || selectedEvent.image || ''} alt="" />
                 <div>
                   <span>{selectedEvent.title?.trim()}</span>
-                  <strong>{selectedMarket.groupItemTitle ?? selectedMarket.question}</strong>
+                  <strong>{selectedMarket.title}</strong>
                 </div>
-              </div>
-
-              <div className="bet-tabs">
-                <button className="active" type="button">Buy</button>
-                <button type="button">Sell</button>
-                <span>Market⌄</span>
               </div>
 
               <div className="bet-outcomes">
@@ -335,9 +541,10 @@ function App() {
                   onClick={() => {
                     setExpandedMarketId(selectedMarket.id)
                     setSelectedOutcome('yes')
+                    setSelectedOrderBookPlatform('combined')
                   }}
                 >
-                  Yes {formatCents(selectedPrices[0])}
+                  Yes {formatCents(selectedMarket.yesPrice)}
                 </button>
                 <button
                   className={selectedOutcome === 'no' ? 'no active' : 'no'}
@@ -345,39 +552,74 @@ function App() {
                   onClick={() => {
                     setExpandedMarketId(selectedMarket.id)
                     setSelectedOutcome('no')
+                    setSelectedOrderBookPlatform('combined')
                   }}
                 >
-                  No {formatCents(selectedPrices[1])}
+                  No {formatCents(selectedMarket.noPrice)}
                 </button>
               </div>
 
               <div className="amount-row">
                 <div>
                   <span>Amount</span>
-                  <small>$34.84 cash</small>
                 </div>
-                <strong>$0</strong>
+                <label className="amount-input">
+                  <span>$</span>
+                  <input
+                    inputMode="decimal"
+                    min="0"
+                    type="text"
+                    value={formatAmountInput(amount)}
+                    onChange={(event) => setAmount(parseAmountInput(event.target.value))}
+                    placeholder="0"
+                  />
+                </label>
               </div>
 
               <div className="quick-amounts">
-                <button type="button">+$1</button>
-                <button type="button">+$5</button>
-                <button type="button">+$10</button>
-                <button type="button">+$100</button>
+                <button type="button" onClick={() => addAmount(1)}>+$1</button>
+                <button type="button" onClick={() => addAmount(5)}>+$5</button>
+                <button type="button" onClick={() => addAmount(10)}>+$10</button>
+                <button type="button" onClick={() => addAmount(100)}>+$100</button>
               </div>
 
               <button className="buy-button" type="button">Buy {selectedOutcome === 'yes' ? 'Yes' : 'No'}</button>
-              <p>By trading, you agree to the Terms of Use.</p>
+              {quote && (
+                <div className="quote-info">
+                  <div className="quote-routes">
+                    <div
+                      className="quote-chart"
+                      style={{ background: routeChart(getQuoteRoutes(quote)) }}
+                    />
+                    <div className="quote-route-list">
+                      {getQuoteRoutes(quote).map((route) => (
+                        <span key={route.platform}>
+                          <i style={{ background: routeColor(route.platform) }} />
+                          {platformLabel(route.platform)} {formatUsd(route.cost)} {route.percent.toFixed(1)}%
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <span>Shares</span>
+                    <strong>{quote.shares.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong>
+                  </div>
+                  <div>
+                    <span>If wins</span>
+                    <strong>{formatUsd(quote.payoutIfWin)}</strong>
+                  </div>
+                  <div>
+                    <span>Profit</span>
+                    <strong>{formatUsd(quote.profitIfWin)}</strong>
+                  </div>
+                </div>
+              )}
             </aside>
           </section>
         ) : events.length > 0 && (
           <div className="markets-grid">
             {events.map((event) => {
-              const markets = ([...(event.markets ?? [])] as Market[]).sort((a, b) => {
-                const aYes = Number(parseJsonList(asText(a.outcomePrices))[0] ?? 0)
-                const bYes = Number(parseJsonList(asText(b.outcomePrices))[0] ?? 0)
-                return bYes - aYes
-              }).slice(0, 2)
+              const markets = ([...(event.markets ?? [])] as Market[]).slice(0, 2)
 
               return (
                 <article
@@ -389,21 +631,20 @@ function App() {
                     setSelectedMarketId(markets[0]?.id ?? '')
                     setExpandedMarketId('')
                     setSelectedOutcome('yes')
+                    setSelectedOrderBookPlatform('combined')
                   }}
                 >
                   <div className="market-head">
-                    <img src={event.image ?? event.icon ?? ''} alt="" />
+                    <img src={event.image ?? ''} alt="" />
                     <h2>{event.title?.trim()}</h2>
                   </div>
 
                   <div className="market-outcomes">
                     {markets.map((market) => {
-                      const prices = parseJsonList(asText(market.outcomePrices))
-
                       return (
                         <div className="market-body" key={market.id}>
-                          <span>{market.groupItemTitle ?? market.question}</span>
-                          <strong>{formatPercent(prices[0])}</strong>
+                          <span>{market.title}</span>
+                          <strong>{formatPercent(market.yesPrice)}</strong>
                           <button type="button" className="yes">Yes</button>
                           <button type="button" className="no">No</button>
                         </div>

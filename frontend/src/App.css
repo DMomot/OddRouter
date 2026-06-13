@@ -410,15 +410,32 @@
 .orderbook-tabs {
   display: flex;
   align-items: center;
-  gap: 24px;
+  justify-content: space-between;
+  gap: 16px;
   padding-bottom: 18px;
   color: #7f8a9b;
   font-size: 15px;
   font-weight: 800;
 }
 
-.orderbook-tabs strong {
-  color: #f3f6fb;
+.orderbook-platforms {
+  display: flex;
+  gap: 8px;
+}
+
+.orderbook-platforms button {
+  padding: 8px 12px;
+  border-radius: 999px;
+  color: #94a3b8;
+  background: #151d29;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.orderbook-platforms button.active,
+.orderbook-platforms button:hover {
+  color: #07110c;
+  background: #86efac;
 }
 
 .orderbook-table {
@@ -657,10 +674,40 @@
   font-weight: 700;
 }
 
-.amount-row strong {
+.amount-row strong,
+.amount-input {
   color: #718096;
-  font-size: 48px;
+  font-size: 26px;
   line-height: 1;
+}
+
+.amount-input {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+  gap: 8px;
+}
+
+.amount-input span {
+  color: #718096;
+  font-size: 24px;
+}
+
+.amount-input input {
+  width: 170px;
+  border: 0;
+  outline: 0;
+  color: #718096;
+  background: transparent;
+  font: inherit;
+  font-weight: 900;
+  text-align: right;
+}
+
+.amount-input input::-webkit-inner-spin-button,
+.amount-input input::-webkit-outer-spin-button {
+  appearance: none;
 }
 
 .quick-amounts {
@@ -688,6 +735,72 @@
   background: #1d8fe8;
   font-size: 16px;
   font-weight: 900;
+}
+
+.quote-info {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #202a39;
+}
+
+.quote-info div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: #8390a1;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.quote-info strong {
+  color: #f3f6fb;
+}
+
+.quote-routes {
+  display: flex !important;
+  align-items: center;
+  justify-content: stretch !important;
+  gap: 12px !important;
+  padding-bottom: 4px;
+}
+
+.quote-chart {
+  width: 54px;
+  height: 54px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  position: relative;
+}
+
+.quote-chart::after {
+  content: '';
+  position: absolute;
+  inset: 13px;
+  border-radius: 50%;
+  background: #101722;
+}
+
+.quote-route-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.quote-route-list span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #86efac;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.quote-route-list i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
 }
 
 .bet-card p {
