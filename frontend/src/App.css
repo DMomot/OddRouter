@@ -39,9 +39,11 @@
   gap: 8px;
   margin-right: 16px;
   color: #f3f6fb;
+  background: transparent;
   font-size: 15px;
   font-weight: 900;
   white-space: nowrap;
+  cursor: pointer;
 }
 
 .brand-mark {
@@ -783,8 +785,9 @@
 }
 
 .quote-route-list {
-  display: grid;
-  gap: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
   min-width: 0;
 }
 
@@ -795,6 +798,7 @@
   color: #86efac;
   font-size: 13px;
   font-weight: 900;
+  white-space: nowrap;
 }
 
 .quote-route-list i {

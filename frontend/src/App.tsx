@@ -370,10 +370,23 @@ function App() {
     <main className="app">
       <header className="header">
         <div className="header-left">
-          <div className="brand">
+          <button
+            className="brand"
+            type="button"
+            onClick={() => {
+              window.history.pushState(null, '', '/')
+              setSelectedEvent(null)
+              setSelectedMarketId('')
+              setExpandedMarketId('')
+              setSelectedOutcome('yes')
+              setSelectedOrderBookPlatform('combined')
+              setOrderBook(null)
+              setQuote(null)
+            }}
+          >
             <span className="brand-mark">O</span>
             <span>OddRouter</span>
-          </div>
+          </button>
         </div>
 
         <div className="header-actions">
