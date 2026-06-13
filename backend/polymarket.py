@@ -1,12 +1,21 @@
+import os
+from pathlib import Path
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import HTTPException
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
 
 GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
 CLOB_CLIENT = ClobClient(CLOB_URL)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
+load_dotenv(ROOT_DIR / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
 async def get_json(url: str) -> Any:
@@ -107,3 +116,39 @@ async def get_event(event_slug: str) -> dict[str, Any]:
 def get_orderbook(token_id: str) -> dict[str, Any]:
     book = CLOB_CLIENT.get_order_book(token_id)
     return normalize_orderbook(book)
+
+
+def get_trading_client() -> ClobClient:
+    private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
+
+    if not private_key:
+        raise HTTPException(status_code=500, detail="POLYMARKET_PRIVATE_KEY is missing")
+
+    client = ClobClient(
+        CLOB_URL,
+        chain_id=int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
+        key=private_key,
+        signature_type=int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
+        funder=os.getenv("POLYMARKET_FUNDER"),
+    )
+    client.set_api_creds(client.create_or_derive_api_creds())
+    return client
+
+
+def place_fok_order(token_id: str, side: str, price: float, size: float) -> Any:
+    if side not in ["buy", "sell"]:
+        raise HTTPException(status_code=400, detail="side must be buy or sell")
+
+    if price <= 0 or size <= 0:
+        raise HTTPException(status_code=400, detail="price and size must be positive")
+
+    client = get_trading_client()
+    order = client.create_order(
+        OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=BUY if side == "buy" else SELL,
+        )
+    )
+    return client.post_order(order, OrderType.FOK)

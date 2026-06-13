@@ -3,3 +3,4 @@ uvicorn
 httpx
 python-dotenv
 py-clob-client
+predict-sdk
