@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import polymarket
 import predictfun
+import lifi
 import merged
 
 app = FastAPI()
@@ -21,6 +22,42 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/api/approvals")
+async def get_approvals(
+    wallet: str,
+    platform: str = "all",
+    tokens: str = "",
+    lifiSpender: str = lifi.LIFI_ROUTER,
+    minAmount: int = 0,
+) -> Any:
+    if not wallet.startswith("0x") or len(wallet) != 42:
+        raise HTTPException(status_code=400, detail="wallet must be an EVM address")
+
+    if platform == "polymarket":
+        return await polymarket.check_approvals(wallet)
+
+    if platform == "predictfun":
+        return await predictfun.check_approvals(wallet)
+
+    if platform == "lifi":
+        return await lifi.check_approvals(wallet, tokens, lifiSpender, minAmount)
+
+    if platform == "all":
+        platforms = [
+            await polymarket.check_approvals(wallet),
+            await predictfun.check_approvals(wallet),
+            await lifi.check_approvals(wallet, tokens, lifiSpender, minAmount),
+        ]
+
+        return {
+            "wallet": wallet,
+            "ready": all(item["ready"] for item in platforms),
+            "platforms": platforms,
+        }
+
+    unsupported_platform(platform)
 
 
 def require_platform(platform: str, expected: str) -> None:

@@ -13,6 +13,40 @@ BASE_URL = "https://api.predict.fun"
 
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+BNB_RPC_URL = os.getenv("BNB_RPC_URL", "https://bsc.api.pocket.network")
+
+
+def clean_address(address: str) -> str:
+    return address.lower().replace("0x", "").rjust(64, "0")
+
+
+async def eth_call(rpc_url: str, to: str, data: str) -> str:
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_call",
+                "params": [{"to": to, "data": data}, "latest"],
+            },
+        )
+
+    result = response.json()
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    return result.get("result", "0x0")
+
+
+async def erc20_allowance(token: str, owner: str, spender: str) -> int:
+    data = "0xdd62ed3e" + clean_address(owner) + clean_address(spender)
+    return int(await eth_call(BNB_RPC_URL, token, data), 16)
+
+
+async def erc1155_approved(token: str, owner: str, operator: str) -> bool:
+    data = "0xe985e9c5" + clean_address(owner) + clean_address(operator)
+    return int(await eth_call(BNB_RPC_URL, token, data), 16) == 1
 
 
 def headers() -> dict[str, str]:
@@ -234,3 +268,91 @@ async def place_fok_order(
             }
         },
     )
+
+
+async def check_approvals(wallet: str) -> dict[str, Any]:
+    try:
+        from predict_sdk import ChainId
+        from predict_sdk.constants import ADDRESSES_BY_CHAIN_ID
+    except ImportError as error:
+        raise HTTPException(status_code=500, detail="predict-sdk is missing") from error
+
+    addresses = ADDRESSES_BY_CHAIN_ID[ChainId.BNB_MAINNET]
+    checks = [
+        ("usdt-ctf-exchange", "erc20", addresses.USDT, addresses.CTF_EXCHANGE),
+        ("usdt-neg-risk-exchange", "erc20", addresses.USDT, addresses.NEG_RISK_CTF_EXCHANGE),
+        ("usdt-yield-ctf-exchange", "erc20", addresses.USDT, addresses.YIELD_BEARING_CTF_EXCHANGE),
+        (
+            "usdt-yield-neg-risk-exchange",
+            "erc20",
+            addresses.USDT,
+            addresses.YIELD_BEARING_NEG_RISK_CTF_EXCHANGE,
+        ),
+        (
+            "conditional-tokens-ctf-exchange",
+            "erc1155",
+            addresses.CONDITIONAL_TOKENS,
+            addresses.CTF_EXCHANGE,
+        ),
+        (
+            "conditional-tokens-neg-risk-exchange",
+            "erc1155",
+            addresses.NEG_RISK_CONDITIONAL_TOKENS,
+            addresses.NEG_RISK_CTF_EXCHANGE,
+        ),
+        (
+            "yield-conditional-tokens-ctf-exchange",
+            "erc1155",
+            addresses.YIELD_BEARING_CONDITIONAL_TOKENS,
+            addresses.YIELD_BEARING_CTF_EXCHANGE,
+        ),
+        (
+            "yield-conditional-tokens-neg-risk-exchange",
+            "erc1155",
+            addresses.YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS,
+            addresses.YIELD_BEARING_NEG_RISK_CTF_EXCHANGE,
+        ),
+        (
+            "yield-conditional-tokens-neg-risk-adapter",
+            "erc1155",
+            addresses.YIELD_BEARING_NEG_RISK_CONDITIONAL_TOKENS,
+            addresses.YIELD_BEARING_NEG_RISK_ADAPTER,
+        ),
+        (
+            "conditional-tokens-neg-risk-adapter",
+            "erc1155",
+            addresses.NEG_RISK_CONDITIONAL_TOKENS,
+            addresses.NEG_RISK_ADAPTER,
+        ),
+    ]
+    approvals = []
+
+    for check_id, check_type, token, spender in checks:
+        if check_type == "erc20":
+            allowance = await erc20_allowance(token, wallet, spender)
+            approvals.append({
+                "id": check_id,
+                "type": check_type,
+                "token": token,
+                "spender": spender,
+                "approved": allowance > 0,
+                "allowance": str(allowance),
+            })
+            continue
+
+        approved = await erc1155_approved(token, wallet, spender)
+        approvals.append({
+            "id": check_id,
+            "type": check_type,
+            "token": token,
+            "spender": spender,
+            "approved": approved,
+        })
+
+    return {
+        "platform": "predictfun",
+        "chainId": 56,
+        "wallet": wallet,
+        "approvals": approvals,
+        "ready": all(item["approved"] for item in approvals),
+    }

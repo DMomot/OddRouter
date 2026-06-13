@@ -270,6 +270,160 @@
   opacity: 0.45;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.approvals-modal {
+  width: min(720px, 100%);
+  max-height: 82vh;
+  overflow-y: auto;
+  border: 1px solid #243244;
+  border-radius: 18px;
+  background: #101722;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+
+.approvals-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid #243244;
+  background: #101722;
+}
+
+.approvals-head div {
+  display: grid;
+  gap: 4px;
+}
+
+.approvals-head span {
+  color: #7d8998;
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.approvals-head strong {
+  color: #f3f6fb;
+  font-size: 18px;
+}
+
+.approvals-head button {
+  padding: 9px 12px;
+  border-radius: 9px;
+  color: #cbd5e1;
+  background: #202b3b;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.approvals-state {
+  margin: 0;
+  padding: 20px;
+  color: #94a3b8;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.approvals-list {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.approval-platform {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid #223044;
+  border-radius: 14px;
+  background: #0b1019;
+}
+
+.approval-platform-head,
+.approval-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.approval-platform-head strong {
+  color: #f3f6fb;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.approval-row {
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  padding: 9px 0;
+  border-top: 1px solid #1c2636;
+}
+
+.approval-row div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.approval-row strong {
+  overflow: hidden;
+  color: #dbe4ef;
+  font-size: 12px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-row span {
+  color: #7d8998;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.approval-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.approval-dot.ok {
+  background: #86efac;
+}
+
+.approval-dot.missing {
+  background: #fb7185;
+}
+
+.approval-status {
+  padding: 5px 8px;
+  border-radius: 999px;
+  font-size: 11px !important;
+  font-weight: 900 !important;
+}
+
+.approval-status.ok {
+  color: #86efac;
+  background: rgba(134, 239, 172, 0.12);
+}
+
+.approval-status.missing {
+  color: #fb7185;
+  background: rgba(251, 113, 133, 0.12);
+}
+
 .detail-view {
   display: grid;
   grid-template-columns: 3fr 1fr;

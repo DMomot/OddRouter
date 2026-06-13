@@ -17,6 +17,15 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
+POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon.drpc.org")
+PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+SPENDERS = {
+    "ctfExchange": "0xE111180000d2663C0091e4f400237545B87B996B",
+    "negRiskExchange": "0xe2222d279d744050d28e00520010520000310F59",
+    "negRiskAdapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
+}
+
 
 async def get_json(url: str) -> Any:
     async with httpx.AsyncClient(timeout=20) as client:
@@ -26,6 +35,39 @@ async def get_json(url: str) -> Any:
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
     return response.json()
+
+
+def clean_address(address: str) -> str:
+    return address.lower().replace("0x", "").rjust(64, "0")
+
+
+async def eth_call(rpc_url: str, to: str, data: str) -> str:
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_call",
+                "params": [{"to": to, "data": data}, "latest"],
+            },
+        )
+
+    result = response.json()
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    return result.get("result", "0x0")
+
+
+async def erc20_allowance(token: str, owner: str, spender: str) -> int:
+    data = "0xdd62ed3e" + clean_address(owner) + clean_address(spender)
+    return int(await eth_call(POLYGON_RPC_URL, token, data), 16)
+
+
+async def erc1155_approved(token: str, owner: str, operator: str) -> bool:
+    data = "0xe985e9c5" + clean_address(owner) + clean_address(operator)
+    return int(await eth_call(POLYGON_RPC_URL, token, data), 16) == 1
 
 
 def parse_list(value: Any) -> list[Any]:
@@ -152,3 +194,35 @@ def place_fok_order(token_id: str, side: str, price: float, size: float) -> Any:
         )
     )
     return client.post_order(order, OrderType.FOK)
+
+
+async def check_approvals(wallet: str) -> dict[str, Any]:
+    approvals = []
+
+    for name, spender in SPENDERS.items():
+        allowance = await erc20_allowance(PUSD, wallet, spender)
+        approvals.append({
+            "id": f"pusd-{name}",
+            "type": "erc20",
+            "token": PUSD,
+            "spender": spender,
+            "approved": allowance > 0,
+            "allowance": str(allowance),
+        })
+
+        approved = await erc1155_approved(CONDITIONAL_TOKENS, wallet, spender)
+        approvals.append({
+            "id": f"conditional-tokens-{name}",
+            "type": "erc1155",
+            "token": CONDITIONAL_TOKENS,
+            "spender": spender,
+            "approved": approved,
+        })
+
+    return {
+        "platform": "polymarket",
+        "chainId": 137,
+        "wallet": wallet,
+        "approvals": approvals,
+        "ready": all(item["approved"] for item in approvals),
+    }

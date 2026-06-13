@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
-import { DynamicWidget } from '@dynamic-labs/sdk-react-core'
+import { DynamicWidget, useDynamicContext } from '@dynamic-labs/sdk-react-core'
 import eventSlugs from './eventIds.json'
 import './App.css'
 
 const apiBaseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
+const lifiApprovalTokens = [
+  '1:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+  '56:0x55d398326f99059fF775485246999027B3197955',
+  '137:0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+].join(',')
 
 type SourcePlatform = 'polymarket' | 'predictfun'
 type OrderBookPlatform = SourcePlatform | 'combined'
@@ -62,6 +67,29 @@ type Quote = {
     platform: SourcePlatform
     cost: number
   }>
+}
+
+type ApprovalItem = {
+  id: string
+  type: string
+  chain?: string
+  chainId?: number
+  token: string
+  spender: string
+  approved: boolean
+  allowance?: string
+}
+
+type PlatformApprovals = {
+  platform: string
+  ready: boolean
+  approvals: ApprovalItem[]
+}
+
+type ApprovalsResponse = {
+  wallet: string
+  ready: boolean
+  platforms: PlatformApprovals[]
 }
 
 type OutcomeSide = 'yes' | 'no'
@@ -159,6 +187,18 @@ function platformLabel(platform: OrderBookPlatform) {
   return 'Combined'
 }
 
+function approvalPlatformLabel(platform: string) {
+  if (platform === 'polymarket') return 'Polymarket'
+  if (platform === 'predictfun') return 'PredictFun'
+  if (platform === 'lifi') return 'Li.Fi'
+
+  return platform
+}
+
+function shortenAddress(value: string) {
+  return `${value.slice(0, 6)}...${value.slice(-4)}`
+}
+
 function getEventSlugFromPath() {
   return window.location.pathname.replace(/^\/+/, '')
 }
@@ -172,6 +212,8 @@ async function fetchApi<T>(path: string): Promise<T> {
 }
 
 function App() {
+  const { primaryWallet } = useDynamicContext()
+  const walletAddress = primaryWallet?.address
   const orderBookTableRef = useRef<HTMLDivElement | null>(null)
   const spreadRowRef = useRef<HTMLDivElement | null>(null)
   const [events, setEvents] = useState<Event[]>([])
@@ -184,6 +226,10 @@ function App() {
   const [orderBookLoading, setOrderBookLoading] = useState(false)
   const [amount, setAmount] = useState('')
   const [quote, setQuote] = useState<Quote | null>(null)
+  const [approvals, setApprovals] = useState<ApprovalsResponse | null>(null)
+  const [approvalsLoading, setApprovalsLoading] = useState(false)
+  const [approvalsError, setApprovalsError] = useState('')
+  const [approvalsOpen, setApprovalsOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -229,6 +275,36 @@ function App() {
     window.addEventListener('popstate', syncEventFromUrl)
     return () => window.removeEventListener('popstate', syncEventFromUrl)
   }, [events])
+
+  useEffect(() => {
+    async function loadApprovals() {
+      if (!walletAddress) {
+        setApprovals(null)
+        setApprovalsOpen(false)
+        return
+      }
+
+      setApprovalsLoading(true)
+      setApprovalsError('')
+
+      try {
+        const params = new URLSearchParams({
+          wallet: walletAddress,
+          platform: 'all',
+          tokens: lifiApprovalTokens,
+        })
+        setApprovals(await fetchApi<ApprovalsResponse>(`/api/approvals?${params.toString()}`))
+        setApprovalsOpen(true)
+      } catch (error) {
+        setApprovalsError(error instanceof Error ? error.message : 'Failed to load approvals')
+        setApprovalsOpen(true)
+      } finally {
+        setApprovalsLoading(false)
+      }
+    }
+
+    loadApprovals()
+  }, [walletAddress])
 
   const placeholderCards = Array.from(
     { length: Math.max(0, 9 - events.length) },
@@ -714,6 +790,54 @@ function App() {
           </div>
         )}
       </section>
+
+      {approvalsOpen && walletAddress && (
+        <div className="modal-backdrop">
+          <div className="approvals-modal">
+            <div className="approvals-head">
+              <div>
+                <span>Wallet approvals</span>
+                <strong>{shortenAddress(walletAddress)}</strong>
+              </div>
+              <button type="button" onClick={() => setApprovalsOpen(false)}>Close</button>
+            </div>
+
+            {approvalsLoading && <p className="approvals-state">Checking approvals...</p>}
+            {approvalsError && <p className="approvals-state error">{approvalsError}</p>}
+
+            {!approvalsLoading && approvals && (
+              <div className="approvals-list">
+                {approvals.platforms.map((platform) => (
+                  <div className="approval-platform" key={platform.platform}>
+                    <div className="approval-platform-head">
+                      <strong>{approvalPlatformLabel(platform.platform)}</strong>
+                      <span className={platform.ready ? 'approval-status ok' : 'approval-status missing'}>
+                        {platform.ready ? 'Ready' : 'Missing'}
+                      </span>
+                    </div>
+
+                    {platform.approvals.map((approval) => (
+                      <div className="approval-row" key={approval.id}>
+                        <span className={approval.approved ? 'approval-dot ok' : 'approval-dot missing'} />
+                        <div>
+                          <strong>{approval.id}</strong>
+                          <span>
+                            {approval.chain ? `${approval.chain} · ` : ''}
+                            {approval.type} · {shortenAddress(approval.token)}
+                          </span>
+                        </div>
+                        <span className={approval.approved ? 'approval-status ok' : 'approval-status missing'}>
+                          {approval.approved ? 'true' : 'false'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </main>
   )
 }
