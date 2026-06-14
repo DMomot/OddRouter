@@ -18,12 +18,13 @@ function loadEnv(filePath) {
 loadEnv(path.resolve('.env'))
 
 const USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
-const POLYGON_PUSD = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB'
+const USDT = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
 
 const apiKey = process.env.LIFI_API_KEY || process.env.VITE_LIFI_API_KEY
 const signer = process.env.LIFI_FROM_ADDRESS
   || process.env.WALLET_ADDRESS
   || (process.env.PK ? privateKeyToAccount(`0x${process.env.PK.replace(/^0x/, '')}`).address : '')
+const amount = process.env.COMPOSER_DOC_AMOUNT || '1000000'
 
 if (!apiKey) throw new Error('Missing LIFI_API_KEY')
 if (!signer) throw new Error('Missing signer address')
@@ -33,39 +34,81 @@ const sdk = createComposeSdk({
   apiKey,
 })
 
-const builder = sdk.flow(1, {
-  name: 'bridge-usdc-to-polygon-pusd',
+const probe = sdk.flow(1, {
+  name: 'proxy-probe',
   inputs: {
     amountIn: resources.erc20(USDC, 1),
   },
 })
 
-builder.lifi.swap('bridge', {
-  bind: { amountIn: builder.inputs.amountIn },
-  config: {
-    resourceOut: resources.erc20(POLYGON_PUSD, 137),
-    slippage: 0.03,
-  },
+probe.core.transfer('transfer-usdc', {
+  bind: { amount: probe.inputs.amountIn, recipient: probe.context.sender },
+  config: {},
 })
 
-console.log(JSON.stringify(builder.build(), null, 2))
 
 try {
-  const result = await builder.compile({
+  const probeResult = await probe.compile({
     signer,
     inputs: {
-      amountIn: materialisers.directDeposit({
-        amount: process.env.COMPOSER_DOC_AMOUNT || '1000000',
-      }),
+      amountIn: materialisers.directDeposit({ amount }),
     },
-    sweepTo: builder.context.sender,
+    checkOnChainAllowances: true,
+    simulationPolicy: 'strict',
   })
+  const quoteParams = new URLSearchParams({
+    fromChain: '1',
+    toChain: '1',
+    fromToken: USDC,
+    toToken: USDT,
+    fromAmount: amount,
+    fromAddress: probeResult.userProxy,
+    toAddress: signer,
+    slippage: '0.03',
+    integrator: 'oddrouter',
+  })
+  const quoteResponse = await fetch(`https://li.quest/v1/quote?${quoteParams.toString()}`, {
+    headers: { 'x-lifi-api-key': apiKey },
+  })
+  const quote = await quoteResponse.json()
+
+  if (!quoteResponse.ok) throw new Error(JSON.stringify(quote))
+  if (!quote.transactionRequest?.to || !quote.transactionRequest?.data) {
+    throw new Error('Li.Fi quote did not return transaction data')
+  }
+
+  const builder = sdk.flow(1, {
+    name: 'raw-lifi-diamond-call',
+    inputs: {},
+  })
+
+  builder.core.rawCall('call-lifi-diamond', {
+    bind: {},
+    config: {
+      target: quote.transactionRequest.to,
+      calldata: quote.transactionRequest.data,
+      callType: 'Call',
+    },
+  })
+
+  const result = await builder.compile({
+    signer,
+    inputs: {},
+    checkOnChainAllowances: true,
+    simulationPolicy: 'strict',
+  })
+
+  if (!result.transactionRequest) throw new Error('Composer did not return transaction data')
 
   console.log(JSON.stringify({
     status: result.status,
     approvals: result.approvals?.length ?? 0,
     userProxy: result.userProxy,
+    lifiTool: quote.tool,
+    lifiTo: quote.transactionRequest.to,
+    lifiSelector: quote.transactionRequest.data.slice(0, 10),
     producedResources: result.producedResources,
+    simulationRevert: result.simulationRevert,
     transactionRequest: result.transactionRequest ? {
       to: result.transactionRequest.to,
       value: result.transactionRequest.value,

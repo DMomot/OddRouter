@@ -166,6 +166,7 @@ type ComposerTransactionRequest = {
 
 type ComposerCompileResult = {
   status: string
+  userProxy?: string
   approvals?: Array<{
     transactionRequest?: ComposerTransactionRequest
   }>
@@ -174,6 +175,23 @@ type ComposerCompileResult = {
 }
 
 type ComposerSimulationPolicy = 'strict' | 'allow-revert'
+
+type LifiQuoteResponse = {
+  message?: string
+  transactionRequest?: {
+    to?: string
+    data?: string
+    value?: string
+  }
+}
+
+type LifiDiamondQuote = {
+  transactionRequest: {
+    to: string
+    data: string
+    value?: string
+  }
+}
 
 type EvmTransactionRequest = {
   to: string
@@ -197,12 +215,24 @@ type ComposeSdkLike = {
     inputs: Record<string, unknown>
   }) => {
     inputs: Record<string, unknown>
-    context: { sender: unknown }
+    context: { sender: unknown; executionAddress: unknown }
     core: {
       split: (id: string, params: {
         bind: { source: unknown }
         config: { bps: number }
       }) => { a: unknown; b: unknown }
+      transfer: (id: string, params: {
+        bind: { amount: unknown; recipient: unknown }
+        config: Record<string, never>
+      }) => unknown
+      approve: (id: string, params: {
+        bind: { amount: unknown }
+        config: { spender: string }
+      }) => unknown
+      rawCall: (id: string, params: {
+        bind: Record<string, never>
+        config: { target: string; calldata: string; callType: 'Call' }
+      }) => unknown
     }
     lifi: {
       swap: (id: string, params: {
@@ -422,6 +452,7 @@ function App() {
   const spreadRowRef = useRef<HTMLDivElement | null>(null)
   const depositWidgetWasOpenRef = useRef(false)
   const depositInitialBalancesRef = useRef<Record<number, bigint>>({})
+  const composerProxyByChainRef = useRef<Record<string, string>>({})
   const [events, setEvents] = useState<Event[]>([])
   const [selectedEvent, setSelectedEvent] = useState<Event | null>(null)
   const [selectedMarketId, setSelectedMarketId] = useState('')
@@ -613,10 +644,12 @@ function App() {
     setApprovalsError('')
 
     try {
+      const lifiSpender = await getComposerProxyForChain(1, ethereumUsdcToken)
       const params = new URLSearchParams({
         wallet: walletAddress,
         platform: 'all',
         tokens: lifiApprovalTokens,
+        lifiSpender,
         minAmount: lifiApprovalMinAmount,
       })
       const loadedApprovals = await fetchApi<ApprovalsResponse>(`/api/approvals?${params.toString()}`)
@@ -628,6 +661,47 @@ function App() {
     } finally {
       setApprovalsLoading(false)
     }
+  }
+
+  async function getComposerProxyForChain(chainId: number, token: string) {
+    if (!walletAddress) throw new Error('Connect wallet first')
+    if (!lifiComposerApiKey) throw new Error('Missing VITE_LIFI_API_KEY')
+
+    const cacheKey = `${walletAddress.toLowerCase()}:${chainId}:${token.toLowerCase()}`
+    const cachedProxy = composerProxyByChainRef.current[cacheKey]
+    if (cachedProxy) return cachedProxy
+
+    const sdk = createComposeSdk({
+      baseUrl: lifiComposerBaseUrl,
+      apiKey: lifiComposerApiKey,
+    }) as unknown as ComposeSdkLike
+    const builder = sdk.flow(chainId, {
+      name: 'oddrouter-approval-proxy-probe',
+      inputs: {
+        amountIn: resources.erc20(token as `0x${string}`, chainId),
+      },
+    })
+
+    builder.core.transfer('transfer-token', {
+      bind: {
+        amount: builder.inputs.amountIn,
+        recipient: builder.context.sender,
+      },
+      config: {},
+    })
+
+    const result = await builder.compile({
+      simulationPolicy: 'strict',
+      checkOnChainAllowances: true,
+      signer: walletAddress,
+      inputs: {
+        amountIn: materialisers.directDeposit({ amount: lifiApprovalMinAmount as `${bigint}` }),
+      },
+    })
+    if (!result.userProxy) throw new Error('Composer did not return user proxy')
+
+    composerProxyByChainRef.current[cacheKey] = result.userProxy
+    return result.userProxy
   }
 
   async function fetchUsdcBalances() {
@@ -815,6 +889,44 @@ function App() {
     throw new Error('Li.Fi destination balances did not update')
   }
 
+  async function getLifiDiamondQuote(
+    source: UsdcChainBalance,
+    target: ComposerTarget,
+    fromAddress: string,
+  ): Promise<LifiDiamondQuote> {
+    if (!walletAddress) throw new Error('Connect wallet first')
+    if (!lifiComposerApiKey) throw new Error('Missing VITE_LIFI_API_KEY')
+
+    const params = new URLSearchParams({
+      fromChain: String(source.chainId),
+      toChain: String(target.chainId),
+      fromToken: source.token,
+      toToken: target.token,
+      fromAmount: target.amount.toString(),
+      fromAddress,
+      toAddress: walletAddress,
+      slippage: '0.03',
+      integrator: 'oddrouter',
+    })
+    const response = await fetch(`https://li.quest/v1/quote?${params.toString()}`, {
+      headers: { 'x-lifi-api-key': lifiComposerApiKey },
+    })
+    const quote = await response.json() as LifiQuoteResponse
+
+    if (!response.ok) throw new Error(quote.message ?? 'Li.Fi quote failed')
+    if (!quote.transactionRequest?.to || !quote.transactionRequest.data) {
+      throw new Error('Li.Fi quote did not return transaction data')
+    }
+
+    return {
+      transactionRequest: {
+        to: quote.transactionRequest.to,
+        data: quote.transactionRequest.data,
+        value: quote.transactionRequest.value,
+      },
+    }
+  }
+
   async function runComposerFlow(
     wallet: EvmPrimaryWallet,
     source: UsdcChainBalance,
@@ -841,20 +953,70 @@ function App() {
       baseUrl: lifiComposerBaseUrl,
       apiKey: lifiComposerApiKey,
     }) as unknown as ComposeSdkLike
-    const builder = sdk.flow(source.chainId, {
-      name: 'oddrouter-split-usdc',
-      inputs: {
-        amountIn: resources.erc20(source.token as `0x${string}`, source.chainId),
-      },
-    })
     const totalAmount = targets.reduce((total, target) => total + target.amount, 0n)
+    const usesDiamondRawCall = targets.length === 1
+    const builder = sdk.flow(source.chainId, {
+      name: usesDiamondRawCall ? 'oddrouter-diamond-bridge-bnb' : 'oddrouter-split-usdc',
+      inputs: usesDiamondRawCall
+        ? { amountIn: resources.erc20(source.token as `0x${string}`, source.chainId) }
+        : { amountIn: resources.erc20(source.token as `0x${string}`, source.chainId) },
+    })
 
-    if (targets.length === 1) {
-      builder.lifi.swap('bridge-to-bnb', {
-        bind: { amountIn: builder.inputs.amountIn },
+    if (usesDiamondRawCall) {
+      const proxyProbe = sdk.flow(source.chainId, {
+        name: 'oddrouter-proxy-probe',
+        inputs: {
+          amountIn: resources.erc20(source.token as `0x${string}`, source.chainId),
+        },
+      })
+
+      proxyProbe.core.transfer('transfer-usdc', {
+        bind: {
+          amount: proxyProbe.inputs.amountIn,
+          recipient: proxyProbe.context.sender,
+        },
+        config: {},
+      })
+
+      const probeResult = await proxyProbe.compile({
+        simulationPolicy: 'strict',
+        checkOnChainAllowances: true,
+        signer: walletAddress,
+        inputs: {
+          amountIn: materialisers.directDeposit({ amount: totalAmount.toString() as `${bigint}` }),
+        },
+      })
+      if (!probeResult.userProxy) throw new Error('Composer did not return user proxy')
+
+      const quote = await getLifiDiamondQuote(source, targets[0], probeResult.userProxy)
+      const transactionRequest = quote.transactionRequest
+
+      debugLog('bridge:lifi-diamond', {
+        to: transactionRequest.to,
+        selector: transactionRequest.data.slice(0, 10),
+      })
+
+      builder.core.transfer('keep-usdc-on-proxy', {
+        bind: {
+          amount: builder.inputs.amountIn,
+          recipient: builder.context.executionAddress,
+        },
+        config: {},
+      })
+      builder.core.approve('approve-lifi-diamond', {
+        bind: {
+          amount: builder.inputs.amountIn,
+        },
         config: {
-          resourceOut: resources.erc20(targets[0].token as `0x${string}`, targets[0].chainId),
-          slippage: 0.03,
+          spender: transactionRequest.to,
+        },
+      })
+      builder.core.rawCall('bridge-to-bnb', {
+        bind: {},
+        config: {
+          target: transactionRequest.to,
+          calldata: transactionRequest.data,
+          callType: 'Call',
         },
       })
     } else {
