@@ -100,6 +100,8 @@ type Quote = {
   filled: boolean
   levels: Array<{
     platform: SourcePlatform
+    price: string
+    shares: number
     cost: number
   }>
 }
@@ -145,6 +147,24 @@ type EvmPrimaryWallet = {
 
 type WalletClientWithRequest = {
   request?: (params: { method: string; params?: unknown[] }) => Promise<unknown>
+}
+
+type WalletClientWithTypedData = WalletClientWithRequest & {
+  signTypedData?: (params: {
+    account?: string
+    domain: Record<string, unknown>
+    types: Record<string, Array<{ name: string; type: string }>>
+    primaryType: string
+    message: Record<string, unknown>
+  }) => Promise<`0x${string}`>
+}
+
+type PolymarketOrderConfig = {
+  chainId: number
+  tickSize: string
+  negRisk: boolean
+  feeRateBps: number
+  exchange: string
 }
 
 type UsdcChainBalance = {
@@ -403,8 +423,14 @@ function getEventSlugFromPath() {
   return window.location.pathname.replace(/^\/+/, '')
 }
 
-async function fetchApi<T>(path: string): Promise<T> {
-  const response = await fetch(`${apiBaseUrl}${path}`)
+async function fetchApi<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
+    ...init,
+    headers: {
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...init?.headers,
+    },
+  })
 
   if (!response.ok) throw new Error(await response.text())
 
@@ -499,6 +525,8 @@ function App() {
   const [orderBookLoading, setOrderBookLoading] = useState(false)
   const [amount, setAmount] = useState('')
   const [quote, setQuote] = useState<Quote | null>(null)
+  const [buyStatus, setBuyStatus] = useState<'idle' | 'signing' | 'submitted' | 'error'>('idle')
+  const [buyError, setBuyError] = useState('')
   const [approvals, setApprovals] = useState<ApprovalsResponse | null>(null)
   const [approvalsLoading, setApprovalsLoading] = useState(false)
   const [approvalsError, setApprovalsError] = useState('')
@@ -1535,6 +1563,154 @@ function App() {
     setAmount(String(Number(amount || 0) + value))
   }
 
+  function toSixDecimals(value: number) {
+    return String(Math.round(value * 1_000_000))
+  }
+
+  function randomSalt() {
+    const values = new Uint32Array(4)
+    crypto.getRandomValues(values)
+    return values.reduce((result, value) => (result << 32n) + BigInt(value), 0n).toString()
+  }
+
+  function getPolymarketOrderInput() {
+    if (!selectedMarket || !quote) throw new Error('Quote is missing')
+
+    const polymarketLevels = quote.levels.filter((level) => level.platform === 'polymarket')
+    if (polymarketLevels.length === 0) throw new Error('Quote has no Polymarket liquidity')
+
+    const tokenId = selectedOutcome === 'yes' ? selectedMarket.yesTokenId : selectedMarket.noTokenId
+    const shares = polymarketLevels.reduce((total, level) => total + Number(level.shares), 0)
+    const cost = polymarketLevels.reduce((total, level) => total + Number(level.cost), 0)
+    const worstPrice = Math.max(...polymarketLevels.map((level) => Number(level.price)))
+
+    if (!tokenId || shares <= 0 || cost <= 0 || worstPrice <= 0) {
+      throw new Error('Invalid Polymarket order input')
+    }
+
+    return {
+      tokenId,
+      shares,
+      cost: worstPrice * shares,
+      quoteCost: cost,
+      price: worstPrice,
+    }
+  }
+
+  async function signPolymarketOrder(order: Record<string, unknown>, config: PolymarketOrderConfig) {
+    const wallet = primaryWallet as unknown as EvmPrimaryWallet | undefined
+    if (!walletAddress || !wallet) throw new Error('Connect wallet first')
+
+    const walletClient = await wallet.getWalletClient(String(config.chainId)) as WalletClientWithTypedData
+    const domain = {
+      name: 'Polymarket CTF Exchange',
+      version: '1',
+      chainId: config.chainId,
+      verifyingContract: config.exchange,
+    }
+    const types = {
+      Order: [
+        { name: 'salt', type: 'uint256' },
+        { name: 'maker', type: 'address' },
+        { name: 'signer', type: 'address' },
+        { name: 'taker', type: 'address' },
+        { name: 'tokenId', type: 'uint256' },
+        { name: 'makerAmount', type: 'uint256' },
+        { name: 'takerAmount', type: 'uint256' },
+        { name: 'expiration', type: 'uint256' },
+        { name: 'nonce', type: 'uint256' },
+        { name: 'feeRateBps', type: 'uint256' },
+        { name: 'side', type: 'uint8' },
+        { name: 'signatureType', type: 'uint8' },
+      ],
+    }
+
+    if (walletClient.signTypedData) {
+      return walletClient.signTypedData({
+        account: walletAddress,
+        domain,
+        types,
+        primaryType: 'Order',
+        message: order,
+      })
+    }
+
+    if (!walletClient.request) throw new Error('Wallet does not support typed data signing')
+
+    return walletClient.request({
+      method: 'eth_signTypedData_v4',
+      params: [walletAddress, JSON.stringify({
+        domain,
+        types: {
+          EIP712Domain: [
+            { name: 'name', type: 'string' },
+            { name: 'version', type: 'string' },
+            { name: 'chainId', type: 'uint256' },
+            { name: 'verifyingContract', type: 'address' },
+          ],
+          ...types,
+        },
+        primaryType: 'Order',
+        message: order,
+      })],
+    }) as Promise<`0x${string}`>
+  }
+
+  async function buyPolymarketOrder() {
+    setBuyStatus('signing')
+    setBuyError('')
+
+    try {
+      if (!walletAddress) throw new Error('Connect wallet first')
+
+      const input = getPolymarketOrderInput()
+      const config = await fetchApi<PolymarketOrderConfig>(`/api/polymarket/order-config/${input.tokenId}`)
+      const order = {
+        salt: randomSalt(),
+        maker: walletAddress,
+        signer: walletAddress,
+        taker: '0x0000000000000000000000000000000000000000',
+        tokenId: input.tokenId,
+        makerAmount: toSixDecimals(input.cost),
+        takerAmount: toSixDecimals(input.shares),
+        expiration: '0',
+        nonce: '0',
+        feeRateBps: String(config.feeRateBps),
+        side: 0,
+        signatureType: 0,
+      }
+      const signature = await signPolymarketOrder(order, config)
+      const signedOrder = {
+        ...order,
+        side: 'BUY',
+        signature,
+      }
+
+      debugLog('polymarket:order', {
+        tokenId: input.tokenId,
+        price: input.price,
+        shares: input.shares,
+        cost: input.cost,
+        quoteCost: input.quoteCost,
+      })
+
+      await fetchApi('/api/polymarket/orders', {
+        method: 'POST',
+        body: JSON.stringify({
+          owner: walletAddress,
+          orderType: 'FOK',
+          order: signedOrder,
+        }),
+      })
+      setBuyStatus('submitted')
+    } catch (error) {
+      const describedError = describeError(error)
+      debugLog('polymarket:order-error', describedError)
+      setBuyError(describedError.message ?? 'Buy failed')
+      setBuyStatus('error')
+    }
+  }
+
   async function openDeposit() {
     depositWidgetWasOpenRef.current = false
     try {
@@ -2011,7 +2187,21 @@ function App() {
                 <button type="button" onClick={() => addAmount(100)}>+$100</button>
               </div>
 
-              <button className="buy-button" type="button">Buy {selectedOutcome === 'yes' ? 'Yes' : 'No'}</button>
+              <button
+                className="buy-button"
+                disabled={buyStatus === 'signing' || !quote}
+                type="button"
+                onClick={buyPolymarketOrder}
+              >
+                {buyStatus === 'signing' ? 'Signing...' : `Buy ${selectedOutcome === 'yes' ? 'Yes' : 'No'}`}
+              </button>
+              {buyStatus !== 'idle' && (
+                <p className={buyStatus === 'error' ? 'bridge-status error' : 'bridge-status'}>
+                  {buyStatus === 'signing' && <span className="approval-spinner" />}
+                  {buyStatus === 'submitted' && <span className="deposit-success-dot" />}
+                  {buyStatus === 'error' ? buyError : buyStatus === 'submitted' ? 'Order submitted' : 'Sign order in wallet'}
+                </p>
+              )}
               {quote && (
                 <div className="quote-info">
                   <div className="quote-routes">

@@ -149,6 +149,16 @@ async def get_orderbook(token_id: str, platform: str = "polymarket", outcome: st
     unsupported_platform(platform)
 
 
+@app.get("/api/polymarket/order-config/{token_id}")
+async def get_polymarket_order_config(token_id: str) -> Any:
+    return polymarket.get_order_config(token_id)
+
+
+@app.post("/api/polymarket/orders")
+async def post_polymarket_order(payload: dict[str, Any]) -> Any:
+    return await polymarket.submit_signed_order(payload)
+
+
 @app.get("/api/categories/{slug}")
 async def get_category(slug: str, platform: str = "predictfun") -> Any:
     if platform == "predictfun":

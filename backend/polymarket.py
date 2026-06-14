@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 from typing import Any
 
@@ -7,7 +8,17 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.endpoints import POST_ORDER
+from py_clob_client.headers.headers import (
+    POLY_ADDRESS,
+    POLY_API_KEY,
+    POLY_PASSPHRASE,
+    POLY_SIGNATURE,
+    POLY_TIMESTAMP,
+)
+from py_clob_client.order_builder.builder import get_contract_config
 from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.signing.hmac import build_hmac_signature
 
 GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
@@ -234,6 +245,65 @@ def place_fok_order(token_id: str, side: str, price: float, size: float) -> Any:
         )
     )
     return client.post_order(order, OrderType.FOK)
+
+
+def get_order_config(token_id: str) -> dict[str, Any]:
+    chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
+    tick_size = CLOB_CLIENT.get_tick_size(token_id)
+    neg_risk = CLOB_CLIENT.get_neg_risk(token_id)
+    fee_rate_bps = CLOB_CLIENT.get_fee_rate_bps(token_id)
+    contract_config = get_contract_config(chain_id, neg_risk)
+
+    return {
+        "chainId": chain_id,
+        "tickSize": tick_size,
+        "negRisk": neg_risk,
+        "feeRateBps": fee_rate_bps,
+        "exchange": contract_config.exchange,
+    }
+
+
+async def submit_signed_order(payload: dict[str, Any]) -> Any:
+    order = payload.get("order")
+    owner = payload.get("owner")
+
+    if not isinstance(order, dict):
+        raise HTTPException(status_code=400, detail="order is required")
+    if not isinstance(owner, str) or not owner.startswith("0x"):
+        raise HTTPException(status_code=400, detail="owner is required")
+
+    api_key = os.getenv("POLYMARKET_API_KEY")
+    api_secret = os.getenv("POLYMARKET_API_SECRET")
+    api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE")
+
+    if not api_key or not api_secret or not api_passphrase:
+        raise HTTPException(status_code=500, detail="Polymarket API credentials are missing")
+
+    body = {
+        "order": order,
+        "owner": owner,
+        "orderType": payload.get("orderType", "FOK"),
+        "postOnly": False,
+    }
+    serialized_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    timestamp = int(__import__("time").time())
+    signature = build_hmac_signature(api_secret, timestamp, "POST", POST_ORDER, serialized_body)
+    headers = {
+        POLY_ADDRESS: owner,
+        POLY_SIGNATURE: signature,
+        POLY_TIMESTAMP: str(timestamp),
+        POLY_API_KEY: api_key,
+        POLY_PASSPHRASE: api_passphrase,
+        "content-type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(f"{CLOB_URL}{POST_ORDER}", headers=headers, content=serialized_body)
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    return response.json()
 
 
 async def check_approvals(wallet: str) -> dict[str, Any]:
