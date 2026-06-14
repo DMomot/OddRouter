@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 from typing import Any
@@ -13,18 +14,28 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 LIFI_ROUTER = "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE"
 NATIVE_TOKEN = "0x0000000000000000000000000000000000000000"
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY") or os.getenv("VITE_ALCHEMY_API_KEY")
+
+
+def rpc_url(chain: str, fallback_env: str, fallback_url: str) -> str:
+    if ALCHEMY_API_KEY:
+        return f"https://{chain}.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+
+    return os.getenv(fallback_env, fallback_url)
+
+
 CHAINS = {
     1: {
         "name": "ethereum",
-        "rpcUrl": os.getenv("ETH_RPC_URL", "https://rpc.nodeflare.app/eth/public"),
+        "rpcUrl": rpc_url("eth-mainnet", "ETH_RPC_URL", "https://rpc.nodeflare.app/eth/public"),
     },
     56: {
         "name": "bsc",
-        "rpcUrl": os.getenv("BNB_RPC_URL", "https://bsc.api.pocket.network"),
+        "rpcUrl": rpc_url("bnb-mainnet", "BNB_RPC_URL", "https://bsc.api.pocket.network"),
     },
     137: {
         "name": "polygon",
-        "rpcUrl": os.getenv("POLYGON_RPC_URL", "https://polygon.drpc.org"),
+        "rpcUrl": rpc_url("polygon-mainnet", "POLYGON_RPC_URL", "https://polygon.drpc.org"),
     },
 }
 
@@ -64,6 +75,48 @@ async def eth_call(rpc_url: str, to: str, data: str) -> str:
     return result.get("result", "0x0")
 
 
+async def eth_call_batch(rpc_url: str, calls: list[tuple[str, str]]) -> list[str]:
+    if not calls:
+        return []
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            rpc_url,
+            json=[
+                {
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "eth_call",
+                    "params": [{"to": to, "data": data}, "latest"],
+                }
+                for index, (to, data) in enumerate(calls)
+            ],
+        )
+
+    if response.status_code >= 400 or not response.text.strip():
+        return [await eth_call(rpc_url, to, data) for to, data in calls]
+
+    try:
+        result = response.json()
+    except ValueError:
+        return [await eth_call(rpc_url, to, data) for to, data in calls]
+
+    if isinstance(result, dict):
+        if "error" in result:
+            raise HTTPException(status_code=502, detail=result["error"])
+        return [result.get("result", "0x0")]
+
+    by_id = {item.get("id"): item for item in result}
+    values = []
+    for index in range(len(calls)):
+        item = by_id.get(index, {})
+        if "error" in item:
+            raise HTTPException(status_code=502, detail=item["error"])
+        values.append(item.get("result", "0x0"))
+
+    return values
+
+
 async def erc20_allowance(rpc_url: str, token: str, owner: str, spender: str) -> int:
     data = "0xdd62ed3e" + clean_address(owner) + clean_address(spender)
     return int(await eth_call(rpc_url, token, data), 16)
@@ -75,7 +128,8 @@ async def check_approvals(
     spender: str = LIFI_ROUTER,
     min_amount: int = 0,
 ) -> dict[str, Any]:
-    approvals = []
+    slots = []
+    groups: dict[str, list[tuple[int, str, str]]] = {}
 
     for item in parse_tokens(tokens):
         chain_id = item["chainId"]
@@ -86,7 +140,7 @@ async def check_approvals(
             raise HTTPException(status_code=400, detail=f"Unsupported Li.Fi chain: {chain_id}")
 
         if token.lower() == NATIVE_TOKEN:
-            approvals.append({
+            slots.append({
                 "id": f"lifi-{chain_id}-native",
                 "chainId": chain_id,
                 "chain": chain["name"],
@@ -98,22 +152,36 @@ async def check_approvals(
             })
             continue
 
-        allowance = await erc20_allowance(chain["rpcUrl"], token, wallet, spender)
-        approvals.append({
+        slots.append({
             "id": f"lifi-{chain_id}-{token.lower()}",
             "chainId": chain_id,
             "chain": chain["name"],
             "type": "erc20",
             "token": token,
             "spender": spender,
-            "approved": allowance > min_amount,
-            "allowance": str(allowance),
+            "approved": False,
+            "allowance": "0",
         })
+        data = "0xdd62ed3e" + clean_address(wallet) + clean_address(spender)
+        groups.setdefault(chain["rpcUrl"], []).append((len(slots) - 1, token, data))
+
+    async def run_group(rpc_url: str, calls: list[tuple[int, str, str]]) -> list[tuple[int, str]]:
+        results = await eth_call_batch(rpc_url, [(token, data) for _, token, data in calls])
+        return [(slot_index, result) for (slot_index, _, _), result in zip(calls, results)]
+
+    batches = await asyncio.gather(
+        *(run_group(rpc_url, calls) for rpc_url, calls in groups.items())
+    )
+    for batch in batches:
+        for slot_index, result in batch:
+            allowance = int(result, 16)
+            slots[slot_index]["approved"] = allowance > min_amount
+            slots[slot_index]["allowance"] = str(allowance)
 
     return {
         "platform": "lifi",
         "wallet": wallet,
         "spender": spender,
-        "approvals": approvals,
-        "ready": bool(approvals) and all(item["approved"] for item in approvals),
+        "approvals": slots,
+        "ready": bool(slots) and all(item["approved"] for item in slots),
     }

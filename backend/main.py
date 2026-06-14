@@ -1,3 +1,6 @@
+import asyncio
+import json
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -24,6 +27,17 @@ def health() -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.post("/api/debug/log")
+async def debug_log(payload: dict[str, Any]) -> dict[str, bool]:
+    print(
+        "[frontend-debug]",
+        datetime.utcnow().isoformat(),
+        json.dumps(payload, ensure_ascii=False, default=str),
+        flush=True,
+    )
+    return {"ok": True}
+
+
 @app.get("/api/approvals")
 async def get_approvals(
     wallet: str,
@@ -45,10 +59,16 @@ async def get_approvals(
         return await lifi.check_approvals(wallet, tokens, lifiSpender, minAmount)
 
     if platform == "all":
+        platforms = await asyncio.gather(
+            polymarket.check_approvals(wallet),
+            predictfun.check_approvals(wallet),
+            lifi.check_approvals(wallet, tokens, lifiSpender, minAmount),
+            return_exceptions=True,
+        )
         platforms = [
-            await polymarket.check_approvals(wallet),
-            await predictfun.check_approvals(wallet),
-            await lifi.check_approvals(wallet, tokens, lifiSpender, minAmount),
+            approval_result("polymarket", wallet, platforms[0], 137),
+            approval_result("predictfun", wallet, platforms[1], 56),
+            approval_result("lifi", wallet, platforms[2]),
         ]
 
         return {
@@ -67,6 +87,25 @@ def require_platform(platform: str, expected: str) -> None:
 
 def unsupported_platform(platform: str) -> None:
     raise HTTPException(status_code=404, detail=f"Unsupported platform: {platform}")
+
+
+def approval_result(platform: str, wallet: str, result: Any, chain_id: int | None = None) -> dict[str, Any]:
+    if not isinstance(result, Exception):
+        return result
+
+    detail = result.detail if isinstance(result, HTTPException) else str(result)
+    print(f"[approvals-error] {platform}: {detail}", flush=True)
+
+    response: dict[str, Any] = {
+        "platform": platform,
+        "wallet": wallet,
+        "approvals": [],
+        "ready": False,
+        "error": detail,
+    }
+    if chain_id:
+        response["chainId"] = chain_id
+    return response
 
 
 @app.get("/api/events/{event_slug}")

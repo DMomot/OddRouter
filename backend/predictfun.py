@@ -13,7 +13,12 @@ BASE_URL = "https://api.predict.fun"
 
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
-BNB_RPC_URL = os.getenv("BNB_RPC_URL", "https://bsc.api.pocket.network")
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY") or os.getenv("VITE_ALCHEMY_API_KEY")
+BNB_RPC_URL = (
+    f"https://bnb-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+    if ALCHEMY_API_KEY
+    else os.getenv("BNB_RPC_URL", "https://bsc.api.pocket.network")
+)
 
 
 def clean_address(address: str) -> str:
@@ -37,6 +42,48 @@ async def eth_call(rpc_url: str, to: str, data: str) -> str:
         raise HTTPException(status_code=502, detail=result["error"])
 
     return result.get("result", "0x0")
+
+
+async def eth_call_batch(rpc_url: str, calls: list[tuple[str, str]]) -> list[str]:
+    if not calls:
+        return []
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            rpc_url,
+            json=[
+                {
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "eth_call",
+                    "params": [{"to": to, "data": data}, "latest"],
+                }
+                for index, (to, data) in enumerate(calls)
+            ],
+        )
+
+    if response.status_code >= 400 or not response.text.strip():
+        return [await eth_call(rpc_url, to, data) for to, data in calls]
+
+    try:
+        result = response.json()
+    except ValueError:
+        return [await eth_call(rpc_url, to, data) for to, data in calls]
+
+    if isinstance(result, dict):
+        if "error" in result:
+            raise HTTPException(status_code=502, detail=result["error"])
+        return [result.get("result", "0x0")]
+
+    by_id = {item.get("id"): item for item in result}
+    values = []
+    for index in range(len(calls)):
+        item = by_id.get(index, {})
+        if "error" in item:
+            raise HTTPException(status_code=502, detail=item["error"])
+        values.append(item.get("result", "0x0"))
+
+    return values
 
 
 async def erc20_allowance(token: str, owner: str, spender: str) -> int:
@@ -325,29 +372,35 @@ async def check_approvals(wallet: str) -> dict[str, Any]:
             addresses.NEG_RISK_ADAPTER,
         ),
     ]
-    approvals = []
-
-    for check_id, check_type, token, spender in checks:
-        if check_type == "erc20":
-            allowance = await erc20_allowance(token, wallet, spender)
-            approvals.append({
-                "id": check_id,
-                "type": check_type,
-                "token": token,
-                "spender": spender,
-                "approved": allowance > 0,
-                "allowance": str(allowance),
-            })
-            continue
-
-        approved = await erc1155_approved(token, wallet, spender)
-        approvals.append({
+    checks = [
+        {
             "id": check_id,
             "type": check_type,
             "token": token,
             "spender": spender,
-            "approved": approved,
-        })
+            "data": (
+                "0xdd62ed3e" + clean_address(wallet) + clean_address(spender)
+                if check_type == "erc20"
+                else "0xe985e9c5" + clean_address(wallet) + clean_address(spender)
+            ),
+        }
+        for check_id, check_type, token, spender in checks
+    ]
+    results = await eth_call_batch(BNB_RPC_URL, [(item["token"], item["data"]) for item in checks])
+    approvals = []
+
+    for check, result in zip(checks, results):
+        value = int(result, 16)
+        approval = {
+            "id": check["id"],
+            "type": check["type"],
+            "token": check["token"],
+            "spender": check["spender"],
+            "approved": value > 0 if check["type"] == "erc20" else value == 1,
+        }
+        if check["type"] == "erc20":
+            approval["allowance"] = str(value)
+        approvals.append(approval)
 
     return {
         "platform": "predictfun",

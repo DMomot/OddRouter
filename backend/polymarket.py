@@ -17,7 +17,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
-POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon.drpc.org")
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY") or os.getenv("VITE_ALCHEMY_API_KEY")
+POLYGON_RPC_URL = (
+    f"https://polygon-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+    if ALCHEMY_API_KEY
+    else os.getenv("POLYGON_RPC_URL", "https://polygon.drpc.org")
+)
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 SPENDERS = {
@@ -58,6 +63,41 @@ async def eth_call(rpc_url: str, to: str, data: str) -> str:
         raise HTTPException(status_code=502, detail=result["error"])
 
     return result.get("result", "0x0")
+
+
+async def eth_call_batch(rpc_url: str, calls: list[tuple[str, str]]) -> list[str]:
+    if not calls:
+        return []
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            rpc_url,
+            json=[
+                {
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "eth_call",
+                    "params": [{"to": to, "data": data}, "latest"],
+                }
+                for index, (to, data) in enumerate(calls)
+            ],
+        )
+
+    result = response.json()
+    if isinstance(result, dict):
+        if "error" in result:
+            raise HTTPException(status_code=502, detail=result["error"])
+        return [result.get("result", "0x0")]
+
+    by_id = {item.get("id"): item for item in result}
+    values = []
+    for index in range(len(calls)):
+        item = by_id.get(index, {})
+        if "error" in item:
+            raise HTTPException(status_code=502, detail=item["error"])
+        values.append(item.get("result", "0x0"))
+
+    return values
 
 
 async def erc20_allowance(token: str, owner: str, spender: str) -> int:
@@ -198,26 +238,39 @@ def place_fok_order(token_id: str, side: str, price: float, size: float) -> Any:
 
 async def check_approvals(wallet: str) -> dict[str, Any]:
     approvals = []
+    checks = []
 
     for name, spender in SPENDERS.items():
-        allowance = await erc20_allowance(PUSD, wallet, spender)
-        approvals.append({
+        checks.append({
             "id": f"pusd-{name}",
             "type": "erc20",
             "token": PUSD,
             "spender": spender,
-            "approved": allowance > 0,
-            "allowance": str(allowance),
+            "data": "0xdd62ed3e" + clean_address(wallet) + clean_address(spender),
         })
 
-        approved = await erc1155_approved(CONDITIONAL_TOKENS, wallet, spender)
-        approvals.append({
+        checks.append({
             "id": f"conditional-tokens-{name}",
             "type": "erc1155",
             "token": CONDITIONAL_TOKENS,
             "spender": spender,
-            "approved": approved,
+            "data": "0xe985e9c5" + clean_address(wallet) + clean_address(spender),
         })
+
+    results = await eth_call_batch(POLYGON_RPC_URL, [(item["token"], item["data"]) for item in checks])
+
+    for check, result in zip(checks, results):
+        value = int(result, 16)
+        approval = {
+            "id": check["id"],
+            "type": check["type"],
+            "token": check["token"],
+            "spender": check["spender"],
+            "approved": value > 0 if check["type"] == "erc20" else value == 1,
+        }
+        if check["type"] == "erc20":
+            approval["allowance"] = str(value)
+        approvals.append(approval)
 
     return {
         "platform": "polymarket",

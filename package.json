@@ -17,5 +17,11 @@
   "bugs": {
     "url": "https://github.com/DMomot/OddRouter/issues"
   },
-  "homepage": "https://github.com/DMomot/OddRouter#readme"
+  "homepage": "https://github.com/DMomot/OddRouter#readme",
+  "dependencies": {
+    "@lifi/compose-spec": "^0.2.0-staging.5",
+    "@lifi/composer-sdk": "^0.2.0-staging.5",
+    "@lifi/sdk": "^4.0.0",
+    "viem": "^2.52.2"
+  }
 }
