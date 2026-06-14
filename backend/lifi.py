@@ -56,6 +56,25 @@ def parse_tokens(tokens: str) -> list[dict[str, Any]]:
     return parsed
 
 
+def parse_spenders(spender: str) -> dict[int, str]:
+    if not spender:
+        return {}
+
+    parsed: dict[int, str] = {}
+    for item in spender.split(","):
+        if ":" not in item:
+            continue
+
+        chain_id, address = item.split(":", 1)
+        parsed[int(chain_id)] = address
+
+    return parsed
+
+
+def spender_for_chain(spender: str, spender_by_chain: dict[int, str], chain_id: int) -> str:
+    return spender_by_chain.get(chain_id, spender)
+
+
 async def eth_call(rpc_url: str, to: str, data: str) -> str:
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(
@@ -126,15 +145,17 @@ async def check_approvals(
     wallet: str,
     tokens: str = "",
     spender: str = LIFI_ROUTER,
-    min_amount: int = 0,
+    min_amount: int = 500_000_000,
 ) -> dict[str, Any]:
     slots = []
     groups: dict[str, list[tuple[int, str, str]]] = {}
+    spender_by_chain = parse_spenders(spender)
 
     for item in parse_tokens(tokens):
         chain_id = item["chainId"]
         token = item["token"]
         chain = CHAINS.get(chain_id)
+        chain_spender = spender_for_chain(spender, spender_by_chain, chain_id)
 
         if not chain:
             raise HTTPException(status_code=400, detail=f"Unsupported Li.Fi chain: {chain_id}")
@@ -146,9 +167,10 @@ async def check_approvals(
                 "chain": chain["name"],
                 "type": "native",
                 "token": token,
-                "spender": spender,
+                "spender": chain_spender,
                 "approved": True,
                 "allowance": "0",
+                "requiredAllowance": str(min_amount),
             })
             continue
 
@@ -158,11 +180,12 @@ async def check_approvals(
             "chain": chain["name"],
             "type": "erc20",
             "token": token,
-            "spender": spender,
+            "spender": chain_spender,
             "approved": False,
             "allowance": "0",
+            "requiredAllowance": str(min_amount),
         })
-        data = "0xdd62ed3e" + clean_address(wallet) + clean_address(spender)
+        data = "0xdd62ed3e" + clean_address(wallet) + clean_address(chain_spender)
         groups.setdefault(chain["rpcUrl"], []).append((len(slots) - 1, token, data))
 
     async def run_group(rpc_url: str, calls: list[tuple[int, str, str]]) -> list[tuple[int, str]]:
@@ -175,8 +198,9 @@ async def check_approvals(
     for batch in batches:
         for slot_index, result in batch:
             allowance = int(result, 16)
-            slots[slot_index]["approved"] = allowance > min_amount
+            slots[slot_index]["approved"] = allowance >= min_amount
             slots[slot_index]["allowance"] = str(allowance)
+            slots[slot_index]["requiredAllowance"] = str(min_amount)
 
     return {
         "platform": "lifi",

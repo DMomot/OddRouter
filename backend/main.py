@@ -44,7 +44,7 @@ async def get_approvals(
     platform: str = "all",
     tokens: str = "",
     lifiSpender: str = lifi.LIFI_ROUTER,
-    minAmount: int = 0,
+    minAmount: int = 500_000_000,
 ) -> Any:
     if not wallet.startswith("0x") or len(wallet) != 42:
         raise HTTPException(status_code=400, detail="wallet must be an EVM address")

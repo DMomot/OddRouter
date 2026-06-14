@@ -18,8 +18,10 @@ const lifiComposerApiKey = import.meta.env.VITE_LIFI_API_KEY ?? import.meta.env.
 const lifiComposerBaseUrl = import.meta.env.VITE_COMPOSER_BASE_URL ?? 'https://ethglobal-composer.li.quest'
 const lifiApprovalTokens = [
   '1:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+  '56:0x55d398326f99059fF775485246999027B3197955',
+  '137:0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB',
 ].join(',')
-const lifiApprovalMinAmount = '2000000'
+const lifiApprovalMinAmount = '500000000'
 const usdcBalanceTokens = [
   { chainId: 1, rpc: 'eth-mainnet', token: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' },
   { chainId: 56, rpc: 'bnb-mainnet', token: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d' },
@@ -41,6 +43,7 @@ const bridgeTargetTokens = {
   bnbUsdt: '0x55d398326f99059fF775485246999027B3197955',
   polygonPusd: '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB',
 }
+const lifiDiamondAddress = '0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE'
 
 type SourcePlatform = 'polymarket' | 'predictfun'
 type OrderBookPlatform = SourcePlatform | 'combined'
@@ -185,6 +188,26 @@ type LifiQuoteResponse = {
   }
 }
 
+type LifiRoute = {
+  id?: string
+  toAmount?: string
+  toAmountMin?: string
+  gasCostUSD?: string
+  steps?: Array<{
+    tool?: string
+    estimate?: {
+      executionDuration?: number
+      toAmount?: string
+      toAmountMin?: string
+    }
+  }>
+}
+
+type LifiRoutesResponse = {
+  message?: string
+  routes?: LifiRoute[]
+}
+
 type LifiDiamondQuote = {
   transactionRequest: {
     to: string
@@ -223,11 +246,24 @@ type ComposeSdkLike = {
       }) => { a: unknown; b: unknown }
       transfer: (id: string, params: {
         bind: { amount: unknown; recipient: unknown }
-        config: Record<string, never>
+        config: { amount?: string }
       }) => unknown
       approve: (id: string, params: {
         bind: { amount: unknown }
         config: { spender: string }
+      }) => unknown
+      call: (id: string, params: {
+        resource?: unknown
+        bind: Record<string, unknown>
+        config: { target: string; functionSignature: string }
+      }) => unknown
+      balanceOf: (id: string, params: {
+        bind: Record<string, never>
+        config: { token: string; owner: string }
+      }) => { balance: unknown }
+      staticCall: (id: string, params: {
+        bind: Record<string, never>
+        config: { target: string; functionSignature: string }
       }) => unknown
       rawCall: (id: string, params: {
         bind: Record<string, never>
@@ -477,6 +513,9 @@ function App() {
   const [bridgeAmount, setBridgeAmount] = useState('')
   const [bridgeStatus, setBridgeStatus] = useState<'idle' | 'waiting' | 'success' | 'error'>('idle')
   const [bridgeError, setBridgeError] = useState('')
+  const [returnDepositOpen, setReturnDepositOpen] = useState(false)
+  const [returnDepositStatus, setReturnDepositStatus] = useState<'idle' | 'waiting' | 'success' | 'error'>('idle')
+  const [returnDepositError, setReturnDepositError] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -644,7 +683,16 @@ function App() {
     setApprovalsError('')
 
     try {
-      const lifiSpender = await getComposerProxyForChain(1, ethereumUsdcToken)
+      const lifiApprovalSpenders = await Promise.all([
+        getComposerProxyForChain(1, ethereumUsdcToken),
+        getComposerProxyForChain(56, bridgeTargetTokens.bnbUsdt),
+        getComposerProxyForChain(137, bridgeTargetTokens.polygonPusd),
+      ])
+      const lifiSpender = [
+        `1:${lifiApprovalSpenders[0]}`,
+        `56:${lifiApprovalSpenders[1]}`,
+        `137:${lifiApprovalSpenders[2]}`,
+      ].join(',')
       const params = new URLSearchParams({
         wallet: walletAddress,
         platform: 'all',
@@ -677,26 +725,22 @@ function App() {
     }) as unknown as ComposeSdkLike
     const builder = sdk.flow(chainId, {
       name: 'oddrouter-approval-proxy-probe',
-      inputs: {
-        amountIn: resources.erc20(token as `0x${string}`, chainId),
-      },
+      inputs: {},
     })
 
-    builder.core.transfer('transfer-token', {
-      bind: {
-        amount: builder.inputs.amountIn,
-        recipient: builder.context.sender,
+    builder.core.staticCall('total-supply', {
+      bind: {},
+      config: {
+        target: token,
+        functionSignature: 'function totalSupply() view returns (uint256)',
       },
-      config: {},
     })
 
     const result = await builder.compile({
       simulationPolicy: 'strict',
       checkOnChainAllowances: true,
       signer: walletAddress,
-      inputs: {
-        amountIn: materialisers.directDeposit({ amount: lifiApprovalMinAmount as `${bigint}` }),
-      },
+      inputs: {},
     })
     if (!result.userProxy) throw new Error('Composer did not return user proxy')
 
@@ -846,7 +890,13 @@ function App() {
         amount: target.amount.toString(),
       })))
 
-      await runComposerFlow(wallet, source, targets, bridgeMode === 'bnb' ? 'strict' : 'allow-revert')
+      if (bridgeMode === 'bnb') {
+        await runComposerFlow(wallet, source, targets, 'strict')
+      } else {
+        for (const target of targets) {
+          await runComposerFlow(wallet, source, [target], 'strict')
+        }
+      }
       await waitForLifiTargetBalances(targets, destinationStartBalances)
       setBridgeStatus('success')
     } catch (error) {
@@ -854,6 +904,57 @@ function App() {
       debugLog('bridge:error', describedError)
       setBridgeError(describedError.message ?? 'Bridge failed')
       setBridgeStatus('error')
+    }
+  }
+
+  async function runReturnDeposit() {
+    setReturnDepositStatus('waiting')
+    setReturnDepositError('')
+
+    try {
+      const wallet = primaryWallet as unknown as EvmPrimaryWallet | undefined
+      if (!walletAddress || !wallet) throw new Error('Connect wallet first')
+
+      const sources = [
+        {
+          chainId: 56,
+          rpc: 'bnb-mainnet',
+          token: bridgeTargetTokens.bnbUsdt,
+          balance: await fetchTokenBalance('bnb-mainnet', bridgeTargetTokens.bnbUsdt),
+        },
+        {
+          chainId: 137,
+          rpc: 'polygon-mainnet',
+          token: bridgeTargetTokens.polygonPusd,
+          balance: await fetchTokenBalance('polygon-mainnet', bridgeTargetTokens.polygonPusd),
+        },
+      ].filter((source) => source.balance > 0n)
+
+      if (sources.length === 0) throw new Error('No BNB or Polygon deposit balance')
+
+      for (const source of sources) {
+        const target = [{
+          chainId: 1,
+          rpc: 'eth-mainnet',
+          token: ethereumUsdcToken,
+          amount: source.balance,
+        }]
+        const destinationStartBalances = await fetchLifiTargetBalances(target)
+        debugLog('return-deposit:composer', {
+          source: `${source.chainId}:${source.token}`,
+          amount: source.balance.toString(),
+          target: `1:${ethereumUsdcToken}`,
+        })
+        await runComposerFlow(wallet, source, target, 'strict')
+        await waitForLifiTargetBalances(target, destinationStartBalances)
+      }
+
+      setReturnDepositStatus('success')
+    } catch (error) {
+      const describedError = describeError(error)
+      debugLog('return-deposit:error', describedError)
+      setReturnDepositError(describedError.message ?? 'Return deposit failed')
+      setReturnDepositStatus('error')
     }
   }
 
@@ -897,34 +998,131 @@ function App() {
     if (!walletAddress) throw new Error('Connect wallet first')
     if (!lifiComposerApiKey) throw new Error('Missing VITE_LIFI_API_KEY')
 
-    const params = new URLSearchParams({
-      fromChain: String(source.chainId),
-      toChain: String(target.chainId),
-      fromToken: source.token,
-      toToken: target.token,
-      fromAmount: target.amount.toString(),
-      fromAddress,
-      toAddress: walletAddress,
-      slippage: '0.03',
-      integrator: 'oddrouter',
-    })
-    const response = await fetch(`https://li.quest/v1/quote?${params.toString()}`, {
-      headers: { 'x-lifi-api-key': lifiComposerApiKey },
-    })
-    const quote = await response.json() as LifiQuoteResponse
-
-    if (!response.ok) throw new Error(quote.message ?? 'Li.Fi quote failed')
-    if (!quote.transactionRequest?.to || !quote.transactionRequest.data) {
-      throw new Error('Li.Fi quote did not return transaction data')
+    const routeRequestBase = {
+        fromChainId: source.chainId,
+        toChainId: target.chainId,
+        fromTokenAddress: source.token,
+        toTokenAddress: target.token,
+        fromAmount: target.amount.toString(),
+        fromAddress,
+        toAddress: walletAddress,
     }
+    const fetchRoutes = async (order: 'CHEAPEST' | 'FASTEST') => {
+      const response = await fetch('https://li.quest/v1/advanced/routes', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-lifi-api-key': lifiComposerApiKey,
+        },
+        body: JSON.stringify({
+          ...routeRequestBase,
+        options: {
+          slippage: 0.03,
+          integrator: 'oddrouter',
+            order,
+          allowSwitchChain: false,
+          allowDestinationCall: false,
+          executionType: 'transaction',
+        },
+        }),
+      })
+      const body = await response.json() as LifiRoutesResponse
+
+      if (!response.ok) throw new Error(body.message ?? `Li.Fi ${order} routes failed`)
+      return body.routes ?? []
+    }
+
+    const [cheapestRoutes, fastestRoutes] = await Promise.all([
+      fetchRoutes('CHEAPEST'),
+      fetchRoutes('FASTEST'),
+    ])
+    const routes = [...cheapestRoutes, ...fastestRoutes]
+    const uniqueRoutes = Array.from(new Map(routes.map((route) => [route.id ?? Math.random().toString(), route])).values())
+
+    const candidates = await Promise.all(uniqueRoutes.slice(0, 10).map(async (route) => {
+      const step = route.steps?.[0]
+      if (!step) return null
+
+      const stepResponse = await fetch('https://li.quest/v1/advanced/stepTransaction', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-lifi-api-key': lifiComposerApiKey,
+        },
+        body: JSON.stringify(step),
+      })
+      const stepQuote = await stepResponse.json() as LifiQuoteResponse
+      if (!stepResponse.ok || !stepQuote.transactionRequest?.to || !stepQuote.transactionRequest.data) return null
+
+      return {
+        route,
+        step,
+        transactionRequest: {
+          to: stepQuote.transactionRequest.to,
+          data: stepQuote.transactionRequest.data,
+          value: stepQuote.transactionRequest.value,
+        },
+      }
+    }))
+
+    const validCandidates = candidates
+      .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
+      .filter((candidate) => isZeroTransactionValue(candidate.transactionRequest.value))
+      .filter((candidate) => candidate.transactionRequest.to.toLowerCase() === lifiDiamondAddress.toLowerCase())
+    const cheapest = [...validCandidates]
+      .sort((a, b) => Number(
+        BigInt(b.route.toAmountMin ?? b.route.toAmount ?? '0') - BigInt(a.route.toAmountMin ?? a.route.toAmount ?? '0'),
+      ))[0]
+    const fastest = [...validCandidates]
+      .sort((a, b) => getRouteDuration(a.route) - getRouteDuration(b.route))[0]
+
+    const best = cheapest
+    if (!best) {
+      throw new Error('Li.Fi did not return a zero-value Diamond route')
+    }
+
+    debugLog('bridge:lifi-route', {
+      fromAddress,
+      routeId: best.route.id,
+      checkedRoutes: uniqueRoutes.length,
+      selected: 'cheapest',
+      toAmount: best.route.toAmount,
+      toAmountMin: best.route.toAmountMin,
+      duration: getRouteDuration(best.route),
+      gasCostUSD: best.route.gasCostUSD,
+      tool: best.step.tool,
+      fastest: fastest ? {
+        routeId: fastest.route.id,
+        tool: fastest.step.tool,
+        toAmount: fastest.route.toAmount,
+        toAmountMin: fastest.route.toAmountMin,
+        duration: getRouteDuration(fastest.route),
+        gasCostUSD: fastest.route.gasCostUSD,
+      } : null,
+      cheapest: cheapest ? {
+        routeId: cheapest.route.id,
+        tool: cheapest.step.tool,
+        toAmount: cheapest.route.toAmount,
+        toAmountMin: cheapest.route.toAmountMin,
+        duration: getRouteDuration(cheapest.route),
+        gasCostUSD: cheapest.route.gasCostUSD,
+      } : null,
+      txValue: best.transactionRequest.value ?? '0',
+      selector: best.transactionRequest.data.slice(0, 10),
+    })
 
     return {
-      transactionRequest: {
-        to: quote.transactionRequest.to,
-        data: quote.transactionRequest.data,
-        value: quote.transactionRequest.value,
-      },
+      transactionRequest: best.transactionRequest,
     }
+  }
+
+  function isZeroTransactionValue(value?: string) {
+    if (!value) return true
+    return BigInt(value) === 0n
+  }
+
+  function getRouteDuration(route: LifiRoute) {
+    return route.steps?.reduce((total, step) => total + (step.estimate?.executionDuration ?? 0), 0) ?? Number.MAX_SAFE_INTEGER
   }
 
   async function runComposerFlow(
@@ -933,6 +1131,42 @@ function App() {
     targets: ComposerTarget[],
     transactionSimulationPolicy: ComposerSimulationPolicy = 'strict',
   ) {
+    if (targets.length === 1) {
+      const approvalResult = await compileComposerFlow(source, targets, 'allow-revert')
+      debugLog('composer:compile-before-approvals', {
+        status: approvalResult.status,
+        userProxy: approvalResult.userProxy,
+        approvals: approvalResult.approvals?.length ?? 0,
+        hasTransaction: Boolean(approvalResult.transactionRequest),
+        simulationRevert: approvalResult.simulationRevert,
+      })
+      await sendComposerApprovals(wallet, source.chainId, approvalResult)
+
+      const transactionResult = await compileComposerFlow(source, targets, transactionSimulationPolicy)
+      debugLog('composer:compile-before-send', {
+        status: transactionResult.status,
+        userProxy: transactionResult.userProxy,
+        approvals: transactionResult.approvals?.length ?? 0,
+        hasTransaction: Boolean(transactionResult.transactionRequest),
+        simulationRevert: transactionResult.simulationRevert,
+      })
+      if (transactionResult.transactionRequest) {
+        debugLog('tenderly:simulation-payload', {
+          network_id: String(source.chainId),
+          from: wallet.address,
+          to: transactionResult.transactionRequest.to,
+          input: transactionResult.transactionRequest.data ?? '0x',
+          value: toHexQuantity(transactionResult.transactionRequest.value ?? '0'),
+          gas: transactionResult.transactionRequest.gasLimit ? Number(transactionResult.transactionRequest.gasLimit) : 8_000_000,
+          save: true,
+          save_if_fails: true,
+        })
+      }
+      if (transactionResult.status !== 'success') return
+      await sendComposerTransaction(wallet, source.chainId, transactionResult)
+      return
+    }
+
     const approvalResult = await compileComposerFlow(source, targets, 'allow-revert')
     await sendComposerApprovals(wallet, source.chainId, approvalResult)
 
@@ -955,61 +1189,57 @@ function App() {
     }) as unknown as ComposeSdkLike
     const totalAmount = targets.reduce((total, target) => total + target.amount, 0n)
     const usesDiamondRawCall = targets.length === 1
+    // let lifiDiamondSpender = lifiDiamondAddress
+    let diamondUserProxy = ''
+    let diamondSpender = ''
     const builder = sdk.flow(source.chainId, {
       name: usesDiamondRawCall ? 'oddrouter-diamond-bridge-bnb' : 'oddrouter-split-usdc',
       inputs: usesDiamondRawCall
-        ? { amountIn: resources.erc20(source.token as `0x${string}`, source.chainId) }
+        ? {
+          amountIn: resources.erc20(source.token as `0x${string}`, source.chainId),
+          proxyRecipient: 'address',
+          diamondSpender: 'address',
+        }
         : { amountIn: resources.erc20(source.token as `0x${string}`, source.chainId) },
     })
 
     if (usesDiamondRawCall) {
-      const proxyProbe = sdk.flow(source.chainId, {
-        name: 'oddrouter-proxy-probe',
-        inputs: {
-          amountIn: resources.erc20(source.token as `0x${string}`, source.chainId),
-        },
-      })
-
-      proxyProbe.core.transfer('transfer-usdc', {
-        bind: {
-          amount: proxyProbe.inputs.amountIn,
-          recipient: proxyProbe.context.sender,
-        },
-        config: {},
-      })
-
-      const probeResult = await proxyProbe.compile({
-        simulationPolicy: 'strict',
-        checkOnChainAllowances: true,
-        signer: walletAddress,
-        inputs: {
-          amountIn: materialisers.directDeposit({ amount: totalAmount.toString() as `${bigint}` }),
-        },
-      })
-      if (!probeResult.userProxy) throw new Error('Composer did not return user proxy')
-
-      const quote = await getLifiDiamondQuote(source, targets[0], probeResult.userProxy)
+      const userProxy = await getComposerProxyForChain(source.chainId, source.token)
+      diamondUserProxy = userProxy
+      const quote = await getLifiDiamondQuote(source, targets[0], userProxy)
       const transactionRequest = quote.transactionRequest
+      diamondSpender = transactionRequest.to
+      // lifiDiamondSpender = transactionRequest.to
 
       debugLog('bridge:lifi-diamond', {
         to: transactionRequest.to,
         selector: transactionRequest.data.slice(0, 10),
       })
 
-      builder.core.transfer('keep-usdc-on-proxy', {
+      builder.core.call('approve-lifi-diamond', {
+        resource: builder.inputs.amountIn,
         bind: {
-          amount: builder.inputs.amountIn,
-          recipient: builder.context.executionAddress,
-        },
-        config: {},
-      })
-      builder.core.approve('approve-lifi-diamond', {
-        bind: {
-          amount: builder.inputs.amountIn,
+          spender: builder.inputs.diamondSpender,
+          value: builder.inputs.amountIn,
         },
         config: {
-          spender: transactionRequest.to,
+          target: source.token,
+          functionSignature: 'function approve(address spender, uint256 value)',
         },
+      })
+      const proxyBalanceAfterApprove = builder.core.balanceOf('read-proxy-usdc-balance-after-approve', {
+        bind: {},
+        config: {
+          token: source.token,
+          owner: userProxy,
+        },
+      })
+      builder.core.transfer('transfer-proxy-balance-to-proxy', {
+        bind: {
+          amount: proxyBalanceAfterApprove.balance,
+          recipient: builder.inputs.proxyRecipient,
+        },
+        config: { amount: '1' },
       })
       builder.core.rawCall('bridge-to-bnb', {
         bind: {},
@@ -1040,10 +1270,16 @@ function App() {
       simulationPolicy,
       checkOnChainAllowances: true,
       signer: walletAddress,
-      inputs: {
-        amountIn: materialisers.directDeposit({ amount: totalAmount.toString() as `${bigint}` }),
-      },
-      sweepTo: builder.context.sender,
+      inputs: usesDiamondRawCall
+        ? {
+          amountIn: materialisers.directDeposit({ amount: totalAmount.toString() as `${bigint}` }),
+          proxyRecipient: diamondUserProxy,
+          diamondSpender,
+        }
+        : {
+          amountIn: materialisers.directDeposit({ amount: totalAmount.toString() as `${bigint}` }),
+        },
+      ...(usesDiamondRawCall ? {} : { sweepTo: builder.context.sender }),
     })
   }
 
@@ -1074,6 +1310,18 @@ function App() {
     }
 
     const alchemySignerWallet = getAlchemySignerWallet() ?? wallet
+    debugLog('tenderly:simulation-payload', {
+      network_id: String(chainId),
+      from: alchemySignerWallet.address,
+      to: transaction.to,
+      input: transaction.data ?? '0x',
+      value: toHexQuantity(transaction.value ?? '0'),
+      gas: transaction.gasLimit ? Number(transaction.gasLimit) : 8_000_000,
+      gas_price: transaction.gasPrice ? toHexQuantity(transaction.gasPrice) : undefined,
+      save: true,
+      save_if_fails: true,
+    })
+
     const prepared = await prepareAlchemyCalls({
       from: alchemySignerWallet.address,
       chainId,
@@ -1535,6 +1783,20 @@ function App() {
           )}
           {walletAddress && (
             <button
+              className="deposit-button"
+              type="button"
+              disabled={returnDepositStatus === 'waiting'}
+              onClick={() => {
+                setReturnDepositStatus('idle')
+                setReturnDepositError('')
+                setReturnDepositOpen(true)
+              }}
+            >
+              Return deposit
+            </button>
+          )}
+          {walletAddress && (
+            <button
               className={approvalsPending ? 'approval-pill loading' : approvalsReady ? 'approval-pill ok' : 'approval-pill missing'}
               type="button"
               onClick={() => setApprovalsOpen(true)}
@@ -1957,6 +2219,36 @@ function App() {
                 {bridgeStatus === 'waiting' && <span className="approval-spinner" />}
                 {bridgeStatus === 'success' && <span className="deposit-success-dot" />}
                 {bridgeStatus === 'error' ? bridgeError : 'Waiting destination balances...'}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {returnDepositOpen && (
+        <div className="modal-backdrop">
+          <div className="bridge-modal">
+            <button className="approvals-close" type="button" onClick={() => setReturnDepositOpen(false)}>×</button>
+            <strong>Return deposit</strong>
+            <span>BNB USDT to Ethereum USDC</span>
+            <span>Polygon pUSD to Ethereum USDC</span>
+            <button
+              className="deposit-button"
+              disabled={returnDepositStatus === 'waiting'}
+              type="button"
+              onClick={runReturnDeposit}
+            >
+              Return to ETH
+            </button>
+            {returnDepositStatus !== 'idle' && (
+              <p className={returnDepositStatus === 'error' ? 'bridge-status error' : 'bridge-status'}>
+                {returnDepositStatus === 'waiting' && <span className="approval-spinner" />}
+                {returnDepositStatus === 'success' && <span className="deposit-success-dot" />}
+                {returnDepositStatus === 'error'
+                  ? returnDepositError
+                  : returnDepositStatus === 'success'
+                    ? 'Returned to Ethereum USDC'
+                    : 'Waiting Ethereum USDC balance...'}
               </p>
             )}
           </div>
